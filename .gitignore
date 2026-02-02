@@ -1,0 +1,13 @@
+node_modules/
+workspace/
+.DS_Store
+*.log
+
+# Large data and backups
+deployment/BACKUP_20260111/
+deployment/OLD/
+deployment/data/samples/
+frontend/OLD/
+scrollytelling/data
+**/index.lock
+

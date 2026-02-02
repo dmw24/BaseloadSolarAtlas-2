@@ -1,0 +1,12 @@
+{
+    "name": "baseload-solar-atlas",
+    "version": "1.0.0",
+    "description": "Baseload Solar Atlas local development environment",
+    "scripts": {
+        "dev": "vite",
+        "start": "vite"
+    },
+    "devDependencies": {
+        "vite": "^6.0.0"
+    }
+}
