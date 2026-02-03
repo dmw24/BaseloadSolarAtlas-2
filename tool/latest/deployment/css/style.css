@@ -1,0 +1,156 @@
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: #1e1e1e;
+    /* surface */
+}
+
+::-webkit-scrollbar-thumb {
+    background: #4a4a4a;
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #606060;
+}
+
+/* Map Styles */
+.leaflet-container {
+    background: #0a0a0a;
+    /* Match body bg */
+    touch-action: none;
+    font-family: 'Inter', sans-serif;
+}
+
+/* Custom Marker Styles if needed */
+.marker-cluster-small {
+    background-color: rgba(168, 199, 250, 0.6);
+    /* primary */
+}
+
+.marker-cluster-small div {
+    background-color: rgba(168, 199, 250, 0.6);
+}
+
+/* Chart Tooltip Customization */
+#chartjs-tooltip {
+    opacity: 1;
+    position: absolute;
+    background: rgba(30, 30, 30, 0.95);
+    /* surface/95 */
+    color: #e3e3e3;
+    /* on-surface */
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    pointer-events: none;
+    transform: translate(-50%, 0);
+    transition: all .1s ease;
+    padding: 8px 12px;
+    font-family: 'Inter', sans-serif;
+    font-size: 0.75rem;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+}
+
+/* Leaflet Popup Customization */
+.leaflet-popup-content-wrapper {
+    background-color: rgba(30, 30, 30, 0.95);
+    /* surface/95 */
+    backdrop-filter: blur(8px);
+    color: #e3e3e3;
+    /* on-surface */
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 1rem;
+    /* rounded-2xl */
+    box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+    /* shadow-xl */
+    padding: 0;
+}
+
+.leaflet-popup-tip {
+    background-color: rgba(30, 30, 30, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    /* Hide top border of tip to blend with wrapper */
+    border-top: none;
+    border-left: none;
+}
+
+.leaflet-popup-content {
+    margin: 0;
+    line-height: 1.5;
+}
+
+/* Legend Gradient */
+.legend-gradient {
+    background: linear-gradient(to right,
+            #0049ff 0%,
+            #0049ff 5%,
+            #00c853 40%,
+            #ff9800 70%,
+            #d32f2f 100%);
+}
+
+.legend-gradient-cost {
+    background: linear-gradient(to right,
+            #0b1d3a 0%,
+            #1d4ed8 12.5%,
+            #16a34a 25%,
+            #eab308 37.5%,
+            #f59e0b 50%,
+            #dc2626 100%);
+    background-size: 100% 100%;
+}
+
+.legend-gradient-delta {
+    background: linear-gradient(to right,
+            #22c55e 0%,
+            #22c55e 33%,
+            #cbd5e1 50%,
+            #ef4444 67%,
+            #ef4444 100%);
+    background-size: 100% 100%;
+}
+
+.legend-gradient-tx {
+    background: linear-gradient(to right,
+            #cbd5e1 0%,
+            #86efac 50%,
+            #22c55e 100%);
+    background-size: 100% 100%;
+}
+
+.legend-gradient-pop {
+    background: linear-gradient(to right,
+            #111827 0%,
+            #4b5563 30%,
+            #9ca3af 60%,
+            #d1d5db 85%,
+            #f3f4f6 100%);
+}
+
+.legend-gradient-potential {
+    background: linear-gradient(to right,
+            #f0fdf4 0%,
+            #bbf7d0 20%,
+            #4ade80 40%,
+            #22c55e 60%,
+            #15803d 80%,
+            #14532d 100%);
+    background-size: 100% 100%;
+}
+
+.legend-gradient-potential-multiple {
+    background: linear-gradient(to right,
+            #f8b4b4 0%,
+            #facc15 50%,
+            #16a34a 100%);
+    background-size: 100% 100%;
+}
+
+/* Map Transitions */
+.transition-color {
+    transition: fill 0.9s ease, stroke 0.9s ease;
+}

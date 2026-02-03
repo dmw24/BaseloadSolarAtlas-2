@@ -1,0 +1,732 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Harnessing the Sun | Baseload Solar Atlas</title>
+
+    <!-- SEO Meta -->
+    <meta name="description"
+        content="Can solar panels and batteries provide reliable baseload power around the clock? An interactive exploration of global solar potential.">
+
+    <!-- DNS Prefetch & Preconnect -->
+    <link rel="dns-prefetch" href="https://cdn.tailwindcss.com">
+    <link rel="dns-prefetch" href="https://unpkg.com">
+    <link rel="dns-prefetch" href="https://d3js.org">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+
+    <!-- Preload critical resources -->
+    <link rel="preload" href="js/parquet_wasm_bg.wasm" as="fetch" crossorigin>
+    <link rel="preload" href="data/simulation_results_summary.parquet" as="fetch" crossorigin>
+
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        serif: ['Libre Baskerville', 'Georgia', 'serif'],
+                    },
+                    colors: {
+                        surface: '#1e1e1e',
+                        'surface-variant': '#2d2d2d',
+                        primary: '#a8c7fa',
+                        'on-surface': '#e3e3e3',
+                        outline: '#8e918f',
+                        accent: '#f59e0b',
+                    }
+                }
+            }
+        }
+    </script>
+
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+
+    <!-- Fonts -->
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&display=swap"
+        rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0"
+        rel="stylesheet" />
+
+    <!-- Custom Scrolly CSS -->
+    <link rel="stylesheet" href="css/scrolly.css">
+</head>
+
+<body class="bg-black text-on-surface font-sans overflow-x-hidden">
+
+    <!-- Loading Overlay -->
+    <div id="loading" class="fixed inset-0 bg-black z-50 flex items-center justify-center">
+        <div class="text-center space-y-4">
+            <div class="w-12 h-12 border-4 border-surface-variant border-t-primary rounded-full animate-spin mx-auto">
+            </div>
+            <div class="text-gray-300 font-medium">Initializing Atlas...</div>
+            <div class="text-xs text-gray-500" id="loading-status">Loading assets...</div>
+        </div>
+    </div>
+
+    <!-- Main Container -->
+    <div class="scrolly-container">
+
+        <!-- Left Panel: Article -->
+        <article class="scrolly-article" id="article">
+
+            <!-- Header / Hero -->
+            <header class="scrolly-hero" data-section="hero">
+                <div class="scrolly-hero-content">
+                    <div class="text-accent text-sm font-medium uppercase tracking-widest mb-4">Energy Transition</div>
+                    <h1 class="scrolly-title">Harnessing the Sun</h1>
+                    <p class="scrolly-subtitle">How Solar and Battery Power Will Transform the World</p>
+                    <div class="scrolly-byline">
+                        <span>By Daan Walter, (...)</span>
+                        <span class="mx-2">•</span>
+                        <span>January 2026</span>
+                    </div>
+                    <div class="scroll-indicator">
+                        <span class="material-symbols-outlined animate-bounce">expand_more</span>
+                        <span class="text-xs text-gray-500">Scroll to explore</span>
+                    </div>
+                </div>
+            </header>
+
+            <!-- Introduction -->
+            <section class="scrolly-section" data-section="introduction" id="section-introduction">
+                <div class="scrolly-section-content">
+                    <h2 class="scrolly-heading">Introduction</h2>
+
+                    <p>In many markets, new solar generation is among the lowest-cost ways to produce electricity. The
+                        standard objection is also clear: solar output is not constant, so it cannot provide electricity
+                        on demand without help.</p>
+
+                    <p>This essay asks a narrower, testable version of that claim:</p>
+
+                    <p>How much "always-available" electricity could a region supply using only solar panels and
+                        batteries?</p>
+
+                    <p>We divide the world into ~5,000 regions, each about 30-40,000 km2 (roughly Maryland or Belgium).
+                        For each region we simulate a simple electricity product: a constant 1 MW load in every hour of
+                        the year.</p>
+
+                    <p>A flat load is not a perfect model of real systems. Real demand rises and falls, and grids
+                        benefit from diversity, flexibility, and trade between regions. But a flat load is a useful
+                        stress test for a specific reason: it removes the option of "moving the customer" to sunny
+                        hours. If solar plus batteries can supply a constant load for a large share of hours, then a
+                        system that also has flexible demand, geographic diversity, and other balancing tools will
+                        generally have more options, not fewer.</p>
+
+                    <p>What follows are nine results that, together, reshape what "firm power" can mean in a
+                        solar-and-storage world.</p>
+                </div>
+            </section>
+
+            <!-- Section 1: The Solar Paradox -->
+            <section class="scrolly-section" data-section="potential-map" id="section-1">
+                <div class="scrolly-section-content">
+                    <h2 class="scrolly-heading">1. Solar energy is abundant everywhere</h2>
+
+                    <p class="scrolly-drop-cap">Start with scale: ignoring timing, is there enough sunlight on land that
+                        is plausibly usable to generate as much electricity as people consume today?</p>
+
+                    <p>In our regional estimates, the answer is yes for most of the world. When you apply basic
+                        constraints (suitable land, plausible build-out density, and realistic conversion efficiencies),
+                        many regions can generate annual solar electricity comparable to, or greater than, today's annual
+                        electricity use.</p>
+
+                    <p>This is not only true in the sunniest deserts. Many temperate and higher-latitude regions also
+                        have enough annual solar resource, given feasible land area, to cover a large share of local
+                        consumption.</p>
+
+                    <p>This does not solve reliability by itself. It does establish that the core limitation is not the
+                        annual energy budget. The limitation is timing.</p>
+                </div>
+            </section>
+
+            <!-- Section 2: Mapping the Solar Potential -->
+            <section class="scrolly-section" data-section="battery-shadow" id="section-2">
+                <div class="scrolly-section-content">
+                    <h2 class="scrolly-heading">2. Batteries make the sun shine at night</h2>
+
+                    <p>Solar has two kinds of variability. It is periodic (day/night) and it is irregular (clouds,
+                        storms, and weather patterns). Seasonality adds a slower swing on top.</p>
+
+                    <p>Batteries address the most immediate mismatch by shifting electricity from when it is generated
+                        to when it is needed. At small sizes, storage mainly covers evening hours. With more capacity, it
+                        extends through the night. At larger capacities, it begins to cover multi-day low-sun periods.</p>
+
+                    <p>As storage grows, two system-level changes follow mechanically: less solar is curtailed (because
+                        more midday surplus is captured), and the delivered electricity profile becomes smoother across
+                        hours.</p>
+                </div>
+            </section>
+
+            <!-- Section 3: Batteries can take us surprisingly far toward baseload -->
+            <section class="scrolly-section" data-section="battery-capacity" id="section-3">
+                <div class="scrolly-section-content">
+                    <h2 class="scrolly-heading">3. Batteries make all the difference</h2>
+
+                    <p>A common mental model is binary: solar is "intermittent," and therefore it must be backed
+                        one-for-one by something else to become "real" power.</p>
+
+                    <p>The simulations show a continuum instead. Adding storage increases uptime in a predictable order:
+                        first evenings become firm, then nights, then the weaker-sun days that appear within a week. In
+                        many regions, modest-to-large storage builds can deliver high uptime, often on the order of
+                        80-90%, without requiring a system designed for 100% availability.</p>
+
+                    <p>This is important because many electricity uses do not require perfect uptime to create large
+                        value. A system that moves from 60% to 90% availability is not "almost the same." It is a
+                        fundamentally different electricity product.</p>
+                </div>
+            </section>
+
+            <!-- Section 4: This is not just for desert countries -->
+            <section class="scrolly-section" data-section="widespread" id="section-4">
+                <div class="scrolly-section-content">
+                    <h2 class="scrolly-heading">4. High uptime solar plus batteries can be found in many places</h2>
+
+                    <p>High-uptime solar systems are often associated with a small set of exceptional locations. Flagship
+                        projects in very sunny regions reinforce that intuition.</p>
+
+                    <p>To test how special those locations really are, we take a fixed solar-plus-battery configuration
+                        and apply it across all ~5,000 regions.</p>
+
+                    <p>The resulting pattern is broad. Very high uptime appears across much of the tropics and
+                        subtropics, and extends well into temperate latitudes. The main driver is not "desert sun"
+                        alone; it is the combination of (i) sufficient average solar resource and (ii) limited seasonal
+                        imbalance relative to the size of the battery.</p>
+                </div>
+            </section>
+
+            <!-- Section 5: High-uptime solar is cheapest where people live -->
+            <section class="scrolly-section" data-section="cheap-populous" id="section-5">
+                <div class="scrolly-section-content">
+                    <h2 class="scrolly-heading">5. High uptime solar is cheap exactly where most people live</h2>
+
+                    <p>The best solar resource in the world is concentrated in deserts, but economic viability does not
+                        require the best resource. It requires a resource that is good enough, combined with costs that
+                        are low enough.</p>
+
+                    <p>Using global average assumptions for solar cost, battery cost, and financing, the cheapest
+                        high-uptime solar clusters in the global sunbelt: India, Southeast Asia, much of sub-Saharan
+                        Africa, and Latin America.</p>
+
+                    <p>When we replace global averages with local capital costs and local financing costs, the absolute
+                        numbers change, sometimes substantially. But the general geographic pattern is resilient: where sunlight
+                        is strong and seasonal swings are moderate, solar-plus-storage remains among the most competitive in the world.</p>
+                </div>
+            </section>
+
+            <!-- Section 6: Cheap exactly where electricity access is weakest -->
+            <section class="scrolly-section" data-section="cheap-access" id="section-6">
+                <div class="scrolly-section-content">
+                    <h2 class="scrolly-heading">6. High uptime solar can help resolve the last mile problem of electricity access</h2>
+
+                    <p>In many low- and middle-income regions, electricity supply is constrained by grid reach, grid
+                        quality, and the cost of expanding distribution. Reliability problems can persist for years even
+                        where generation capacity exists on paper.</p>
+
+                    <p>Those same regions often have climate conditions that make solar-plus-storage perform well: high
+                        yields and relatively stable seasonal patterns. In those settings, the cost of delivering a
+                        high-uptime local supply can be competitive with, or lower than, the full cost of extending and
+                        maintaining long distribution lines and reinforcing upstream infrastructure.</p>
+
+                    <p>For communities without dependable service, the relevant comparison is not "solar versus a
+                        perfectly reliable grid." It is "solar-plus-storage versus the service people actually receive
+                        today."</p>
+                </div>
+            </section>
+
+            <!-- Section 7: Better uptime than many existing grids -->
+            <section class="scrolly-section" data-section="better-uptime" id="section-7">
+                <div class="scrolly-section-content">
+                    <h2 class="scrolly-heading">7. Even without backup, solar plus battery reliability can already exceed many grids</h2>
+
+                    <p>In large parts of the world, the electricity grid is not highly reliable. Outages, load shedding, and
+                        voltage instability are common enough that households and businesses already pay for backup, such as diesel
+                        generators, inverters, or the cost of lost output. Over 2 billion people live in places where grid service
+                        is far less reliable than the typical &gt;99% uptime seen in many wealthy countries.</p>
+                     
+                     <p>Making a centralized grid highly reliable is possible, but it is expensive because reliability has to be
+                        built into every layer: spare generation capacity, redundant transmission, hardened distribution networks,
+                        and consistent last-mile maintenance.</p>
+                     
+                     <p>Against that baseline, a solar-plus-battery system that delivers dependable power for most hours, even if
+                        it is not perfect, can be a meaningful upgrade. It can also be deployed and scaled faster than large
+                        centralized expansions.</p>
+                     
+                     <p>For those customers, near-perfect reliability is not the benchmark. They have never had it. The relevant
+                        comparison is the power they actually get today, including the full cost of making that power usable:
+                        tariffs and fees, voltage damage, downtime, and the extra spending required to bridge outages. In that
+                        context, solar-plus-battery does not need to match the reliability of the best-performing grids to win. It
+                        needs to be <em>more dependable</em> than the grid customers experience, and <em>lower cost per usable
+                        kilowatt-hour</em> than the electricity they buy today.</p>
+                     
+                     <p>This is the classic entry point for disruption in Christensen’s <em>The Innovator’s Dilemma</em>: a large
+                        under-served market that incumbents do not prioritize. Utilities and centralized grid planners are set up
+                        to optimize dense demand, regulated returns, and large infrastructure projects, not to serve millions of
+                        dispersed, price-sensitive customers who mainly need power that is dependable enough at the lowest
+                        possible cost.</p>
+                     
+                     <p>In that market, solar-plus-battery is already good enough because it can deliver higher uptime and lower
+                        cost per usable kilowatt-hour at the same time. It turns electricity from an unpredictable constraint into
+                        a managed supply. That combination, more reliable power at lower delivered cost, is what makes it the
+                        disruptive wedge. From there, continued cost declines and operational improvements push performance
+                        upmarket, expanding from backup replacement into primary power.</p>
+                     
+                </div>
+            </section>
+
+            <!-- Section 8: High-uptime solar is cheapest where new capacity is being planned -->
+            <section class="scrolly-section" data-section="planned-capacity" id="section-8">
+                <div class="scrolly-section-content">
+                    <h2 class="scrolly-heading">8. High uptime solar is cheap exactly where other "firm" capacity is being planned right now</h2>
+
+                    <p>Electricity demand is still rising, especially in emerging economies. Planning documents in these
+                        regions often call for large additions of "firm" capacity, commonly coal, gas, or nuclear.</p>
+
+                    <p>Those plans are concentrated in many of the same climates where solar-plus-storage already
+                        achieves high uptime at attractive cost. That overlap matters: it means that a portion of what is
+                        currently labeled "baseload" build-out could be met by solar plus batteries instead.</p>
+
+                    <p>This does not imply solar replaces every plant everywhere. It implies that "firm power must be
+                        fuel-based" is no longer a safe default assumption in large parts of the world.</p>
+                </div>
+            </section>
+
+            <!-- Section 9: Getting cheaper over time -->
+            <section class="scrolly-section" data-section="lcoe-outlook" id="section-9">
+                <div class="scrolly-section-content">
+                    <h2 class="scrolly-heading">9. Costs will continue to fall and further increase competitiveness </h2>
+
+                    <p>All results above use today's costs.</p>
+
+                    <p>But solar and batteries have both fallen in cost dramatically over time, and most outlooks expect
+                        further reductions. As costs fall, regions that are already attractive become even more so, and
+                        additional regions cross from "close" to "clearly competitive."</p>
+
+                    <p>In other words: the viability map for high-uptime solar is not static. It expands as costs
+                        decline.</p>
+                </div>
+            </section>
+
+            <!-- Section 10: The Path Forward -->
+            <section class="scrolly-section" data-section="path-forward" id="section-10">
+                <div class="scrolly-section-content">
+                    <h2 class="scrolly-heading">The path forward</h2>
+
+                    <p>If solar plus batteries can deliver a high-uptime electricity product across much of the world, the
+                        remaining bottlenecks shift away from physics and toward institutions.</p>
+
+                    <p>The hardest constraints become: permitting and interconnection queues; financing structures that
+                        penalize capital-heavy projects in higher-risk markets; market rules designed around thermal
+                        generators; and planning frameworks that equate "firm" with "fuel."</p>
+
+                    <p class="scrolly-final">The technology is ready. In many regions, the economics are already
+                        compelling. What happens next depends on whether utilities, regulators, financiers, and planners
+                        update systems built for a different era of power.</p>
+
+                    <div class="scrolly-cta">
+                        <a href="../deployment/index.html" class="scrolly-button">
+                            <span class="material-symbols-outlined">explore</span>
+                            Explore the Full Interactive Tool
+                        </a>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Footer -->
+            <footer class="scrolly-footer">
+                <div class="scrolly-footer-content">
+                    <h3 class="text-lg font-medium text-white mb-4">Data Sources</h3>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs text-gray-400">
+                        <div>
+                            <strong class="text-gray-300">Solar & Weather Data:</strong>
+                            <p>NASA POWER (Prediction of Worldwide Energy Resources)</p>
+                        </div>
+                        <div>
+                            <strong class="text-gray-300">Population Data:</strong>
+                            <p>NASA SEDAC, Gridded Population of the World (GPW), v4</p>
+                        </div>
+                        <div>
+                            <strong class="text-gray-300">Electricity Consumption:</strong>
+                            <p>Chen et al. (2022), Global 1km × 1km gridded electricity consumption</p>
+                        </div>
+                        <div>
+                            <strong class="text-gray-300">Power Plant Data:</strong>
+                            <p>Global Energy Monitor, December 2024 release</p>
+                        </div>
+                    </div>
+                    <div class="mt-8 pt-4 border-t border-white/10 text-center text-xs text-gray-500">
+                        <p>Created by Daan Walter, 2025 • Baseload Solar Atlas</p>
+                    </div>
+                </div>
+            </footer>
+        </article>
+
+        <!-- Right Panel: Visuals -->
+        <div class="scrolly-visual" id="visual-panel">
+            <!-- Map Container -->
+            <div id="map" class="absolute inset-0 z-0 bg-[#0a0a0a]"></div>
+
+            <!-- Section Indicator -->
+            <div class="section-indicator" id="section-indicator">
+                <div class="section-dot active" data-target="section-1"></div>
+                <div class="section-dot" data-target="section-2"></div>
+                <div class="section-dot" data-target="section-3"></div>
+                <div class="section-dot" data-target="section-4"></div>
+                <div class="section-dot" data-target="section-5"></div>
+                <div class="section-dot" data-target="section-6"></div>
+                <div class="section-dot" data-target="section-7"></div>
+                <div class="section-dot" data-target="section-8"></div>
+                <div class="section-dot" data-target="section-9"></div>
+                <div class="section-dot" data-target="section-10"></div>
+            </div>
+
+            <!-- Visual Label -->
+            <div class="visual-label" id="visual-label">
+                <div class="visual-label-title">Capacity Factor</div>
+                <div class="visual-label-subtitle">Solar: 5 MW • Battery: 8 MWh</div>
+            </div>
+
+            <!-- Potential Constraints Toggle (Section 1) -->
+            <div id="potential-toggle" class="hidden potential-toggle">
+                <div class="text-[10px] text-gray-400 uppercase tracking-wider">Solar Potential</div>
+                <div class="grid grid-cols-2 bg-white/5 rounded p-0.5" id="potential-toggle-buttons">
+                    <button data-level="level1"
+                        class="px-2 py-0.5 rounded text-[10px] font-medium bg-gray-600 text-white shadow-sm">Technical</button>
+                    <button data-level="level2"
+                        class="px-2 py-0.5 rounded text-[10px] font-medium text-gray-400 hover:text-white">Policy</button>
+                </div>
+                <div id="potential-toggle-help" class="text-[10px] text-gray-400 leading-snug">
+                    Technical: physical suitability + resource constraints only.
+                </div>
+            </div>
+
+            <!-- Legend (Capacity Factor) -->
+            <div id="legend-capacity" class="visual-legend">
+                <div class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">Capacity Factor</div>
+                <div class="w-full h-2 rounded-full mb-2 legend-gradient"></div>
+                <div class="flex justify-between text-[10px] font-mono text-gray-500">
+                    <span>0%</span>
+                    <span>40%</span>
+                    <span>70%</span>
+                    <span>90%</span>
+                    <span>100%</span>
+                </div>
+            </div>
+
+            <!-- Legend (LCOE) - Hidden by default -->
+            <div id="legend-lcoe" class="visual-legend hidden">
+                <div class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">LCOE ($/MWh)</div>
+                <div class="w-full h-2 rounded-full mb-2 legend-gradient-cost"></div>
+                <div class="flex justify-between text-[10px] font-mono text-gray-500">
+                    <span id="legend-lcoe-min">--</span>
+                    <span id="legend-lcoe-mid">--</span>
+                    <span id="legend-lcoe-max">--</span>
+                </div>
+            </div>
+
+            <!-- Legend (Potential Multiple) - Hidden by default -->
+            <div id="legend-potential" class="visual-legend hidden">
+                <div class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">
+                    Solar Potential / Demand (×)
+                </div>
+                <div id="legend-potential-buckets" class="space-y-1 text-[10px] text-gray-400"></div>
+            </div>
+
+            <!-- Legend (Population) - Hidden by default -->
+            <div id="legend-population" class="visual-legend hidden">
+                <div class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">Population</div>
+                <div class="w-full h-2 rounded-full mb-2 legend-gradient-pop"></div>
+                <div class="flex justify-between text-[10px] font-mono text-gray-500">
+                    <span>Sparse</span>
+                    <span>Dense</span>
+                </div>
+            </div>
+
+            <!-- Legend (Access) - Hidden by default -->
+            <div id="legend-access" class="visual-legend hidden">
+                <div class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">Grid Reliability</div>
+                <div class="w-full h-2 rounded-full mb-2"
+                    style="background: linear-gradient(to right, #ef4444, #eab308, #22c55e);"></div>
+                <div class="flex justify-between text-[10px] font-mono text-gray-500">
+                    <span>0%</span>
+                    <span>50%</span>
+                    <span>100%</span>
+                </div>
+            </div>
+
+            <!-- Legend (Uptime Comparison) - Hidden by default -->
+            <div id="legend-uptime" class="visual-legend hidden">
+                <div class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">Grid Reliability</div>
+                <div class="w-full h-2 rounded-full mb-2"
+                    style="background: linear-gradient(to right, #ef4444, #000000);"></div>
+                <div class="flex justify-between text-[10px] font-mono text-gray-500">
+                    <span>0% (Fragile)</span>
+                    <span>100% (Robust)</span>
+                </div>
+            </div>
+
+            <!-- Legend (Weekly Animation) - Hidden by default -->
+            <div id="legend-weekly" class="visual-legend hidden">
+                <div class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-3">Energy Share (1 MW load)
+                </div>
+                <div class="space-y-2">
+                    <div class="flex items-center gap-2">
+                        <div class="w-3 h-3 rounded-sm bg-[#facc15]"></div>
+                        <span class="text-[10px] text-gray-400">Sun (Direct Solar)</span>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <div class="w-3 h-3 rounded-sm bg-[#a855f7]"></div>
+                        <span class="text-[10px] text-gray-400">Battery Discharge</span>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <div class="w-3 h-3 rounded-sm bg-[#9ca3af]"></div>
+                        <span class="text-[10px] text-gray-400">Back-up Power</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Animation Indicator -->
+            <div id="animation-indicator"
+                class="hidden absolute top-6 right-8 bg-surface/90 backdrop-blur-md border border-white/10 rounded-xl p-3 shadow-lg min-w-[340px]">
+                <div class="flex flex-col gap-3">
+                    <div class="flex items-center gap-2 border-b border-white/10 pb-1 mb-1">
+                        <span class="material-symbols-outlined text-accent animate-pulse">battery_charging_full</span>
+                        <div class="text-[11px] text-gray-300">
+                            For <span class="text-white font-medium">1 MW</span> baseload:
+                        </div>
+                    </div>
+
+                    <div id="weekly-controls" class="space-y-2">
+                        <div class="space-y-1">
+                            <div class="text-[10px] text-gray-400 uppercase tracking-wider">Configuration</div>
+                            <div id="weekly-config-toggle" class="grid grid-cols-4 gap-1 bg-white/5 rounded p-1">
+                                <button data-config="simplistic"
+                                    class="px-2 py-1 rounded text-[10px] font-medium text-gray-400 hover:text-white transition-colors leading-tight text-center">
+                                    Simplistic
+                                    <span class="block text-[9px] text-gray-500 leading-tight">1 MW solar</span>
+                                </button>
+                                <button data-config="overbuilt"
+                                    class="px-2 py-1 rounded text-[10px] font-medium text-gray-400 hover:text-white transition-colors leading-tight text-center">
+                                    Overbuilt
+                                    <span class="block text-[9px] text-gray-500 leading-tight">6 MW solar</span>
+                                </button>
+                                <button data-config="overbuilt-storage"
+                                    class="px-2 py-1 rounded text-[10px] font-medium text-gray-400 hover:text-white transition-colors leading-tight text-center">
+                                    Overbuilt + storage
+                                    <span class="block text-[9px] text-gray-500 leading-tight">6 MW + 16 MWh</span>
+                                </button>
+                                <button data-config="high-uptime"
+                                    class="px-2 py-1 rounded text-[10px] font-medium text-gray-400 hover:text-white transition-colors leading-tight text-center">
+                                    High uptime
+                                    <span class="block text-[9px] text-gray-500 leading-tight">10 MW + 30 MWh</span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="space-y-1">
+                            <div class="text-[10px] text-gray-400 uppercase tracking-wider">Season</div>
+                            <div id="weekly-season-toggle" class="grid grid-cols-4 gap-1 bg-white/5 rounded p-1">
+                                <button data-season="spring"
+                                    class="px-2 py-1 rounded text-[10px] font-medium text-gray-400 hover:text-white transition-colors text-center">Spring</button>
+                                <button data-season="summer"
+                                    class="px-2 py-1 rounded text-[10px] font-medium text-gray-400 hover:text-white transition-colors text-center">Summer</button>
+                                <button data-season="fall"
+                                    class="px-2 py-1 rounded text-[10px] font-medium text-gray-400 hover:text-white transition-colors text-center">Fall</button>
+                                <button data-season="winter"
+                                    class="px-2 py-1 rounded text-[10px] font-medium text-gray-400 hover:text-white transition-colors text-center">Winter</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="battery-capacity-controls" class="hidden space-y-2">
+                        <div class="space-y-1">
+                            <div class="text-[10px] text-gray-400 uppercase tracking-wider">Solar</div>
+                            <div class="flex items-center justify-between text-xs text-gray-300">
+                                <span>Solar:</span>
+                                <span class="font-mono text-primary"><span id="solar-value-display">6</span> MW</span>
+                            </div>
+                            <input type="range" id="solar-slider" min="1" max="10" value="6" step="1"
+                                class="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-primary hover:accent-primary/80 transition-colors">
+                        </div>
+                    </div>
+
+                    <div id="battery-loop-readout" class="hidden text-xs text-gray-300">
+                        Battery:
+                        <span class="font-mono text-accent"><span id="animation-value">0</span> MWh</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- LCOE Outlook Panel -->
+            <div id="lcoe-outlook-panel"
+                class="hidden absolute top-6 right-6 bg-surface/90 backdrop-blur-md border border-white/10 rounded-xl p-4 shadow-lg w-64 space-y-3">
+                <div class="flex items-center justify-between">
+                    <div id="lcoe-outlook-title" class="text-xs font-medium text-gray-300 uppercase tracking-wider">
+                        LCOE Outlook
+                    </div>
+                    <button id="lcoe-outlook-play"
+                        class="px-2 py-0.5 rounded bg-white/10 text-gray-300 text-[10px] hover:text-white hover:bg-white/20 transition-colors">
+                        Play
+                    </button>
+                </div>
+                <div id="lcoe-outlook-timeline" class="space-y-2">
+                    <div class="flex items-center justify-between text-[10px] text-gray-400">
+                        <span>Year</span>
+                        <span id="lcoe-outlook-year" class="font-mono text-sky-300">2026</span>
+                    </div>
+                    <input type="range" id="lcoe-outlook-slider" min="2026" max="2050" step="1" value="2026"
+                        class="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-sky-400">
+                </div>
+                <div class="space-y-2">
+                    <div class="text-[10px] text-gray-400 uppercase tracking-wider">Capex Source</div>
+                    <div id="lcoe-outlook-capex-toggle" class="grid grid-cols-2 bg-white/5 rounded p-0.5">
+                        <button data-mode="global"
+                            class="px-2 py-0.5 rounded text-[10px] font-medium bg-gray-600 text-white shadow-sm">Global</button>
+                        <button data-mode="local"
+                            class="px-2 py-0.5 rounded text-[10px] font-medium text-gray-400 hover:text-white">Local</button>
+                    </div>
+                </div>
+                <div class="space-y-2">
+                    <div class="text-[10px] text-gray-400 uppercase tracking-wider">WACC Source</div>
+                    <div id="lcoe-outlook-wacc-toggle" class="grid grid-cols-2 bg-white/5 rounded p-0.5">
+                        <button data-mode="global"
+                            class="px-2 py-0.5 rounded text-[10px] font-medium bg-gray-600 text-white shadow-sm">Global</button>
+                        <button data-mode="local"
+                            class="px-2 py-0.5 rounded text-[10px] font-medium text-gray-400 hover:text-white">Local</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Standalone Target CF Slider (Deprecated - content moved inline) -->
+            <div id="target-cf-container" class="hidden"></div>
+
+            <!-- Dual Globe Container (for Step 4) -->
+            <div id="dual-globe-container" class="hidden absolute inset-0 z-10 flex flex-col bg-[#0a0a0a]">
+
+                <!-- View Toggle (Top Center) -->
+                <div
+                    class="absolute top-4 left-1/2 transform -translate-x-1/2 z-20 bg-surface/80 backdrop-blur border border-white/10 rounded-full p-1 flex gap-1">
+                    <button id="step4-btn-map"
+                        class="px-3 py-1 text-[10px] font-medium rounded-full bg-white/10 text-white transition-colors hover:bg-white/20">Map
+                        View</button>
+                    <button id="step4-btn-chart"
+                        class="px-3 py-1 text-[10px] font-medium rounded-full text-gray-400 transition-colors hover:text-white hover:bg-white/10">Chart
+                        View</button>
+                </div>
+
+                <!-- Chart Axes Layer (Hidden in Map Mode) -->
+                <div id="step4-chart-axes"
+                    class="absolute inset-0 z-10 pointer-events-none opacity-0 transition-opacity duration-500"></div>
+
+                <!-- Top Globe: LCOE -->
+                <div class="flex-1 relative overflow-hidden transition-all duration-700" id="globe-lcoe-container">
+                    <div id="globe-lcoe-frame"
+                        class="absolute inset-5 rounded-2xl border border-white/5 bg-[#0f0f0f]/60 backdrop-blur-sm overflow-hidden">
+                        <svg id="globe-lcoe" class="absolute inset-0 w-full h-full z-0"></svg>
+                        <canvas id="globe-lcoe-dots"
+                            class="absolute inset-0 w-full h-full z-10 pointer-events-none"></canvas>
+                        <svg id="globe-lcoe-axes" class="absolute inset-0 w-full h-full z-20 pointer-events-none"></svg>
+                    </div>
+                    <div id="globe-lcoe-label" class="visual-legend">
+                        <div class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">LCOE ($/MWh)</div>
+                        <div class="w-full h-2 rounded-full mb-2 legend-gradient-cost"></div>
+                        <div class="flex justify-between text-[10px] font-mono text-gray-500">
+                            <span>$50</span>
+                            <span>$200+</span>
+                        </div>
+                    </div>
+                </div>
+                <!-- Divider -->
+                <div id="step4-divider" class="h-px bg-white/10 transition-opacity duration-500"></div>
+                <!-- Bottom Globe: Population -->
+                <div class="flex-1 relative overflow-hidden transition-all duration-700" id="globe-pop-container">
+                    <div id="globe-pop-frame"
+                        class="absolute inset-5 rounded-2xl border border-white/5 bg-[#0f0f0f]/60 backdrop-blur-sm overflow-hidden">
+                        <svg id="globe-population" class="absolute inset-0 w-full h-full z-0"></svg>
+                        <canvas id="globe-pop-dots"
+                            class="absolute inset-0 w-full h-full z-10 pointer-events-none"></canvas>
+                        <svg id="globe-pop-axes" class="absolute inset-0 w-full h-full z-20 pointer-events-none"></svg>
+                    </div>
+                    <div id="globe-pop-label" class="visual-legend">
+                        <div class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">Population</div>
+                        <div class="w-full h-2 rounded-full mb-2 legend-gradient-pop"></div>
+                        <div class="flex justify-between text-[10px] font-mono text-gray-500">
+                            <span>Sparse</span>
+                            <span>Dense</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Chart Container (slides up when visible) -->
+            <div id="chart-container" class="hidden">
+                <!-- Single Chart Layout (Default) -->
+                <div id="chart-layout-single" class="chart-wrapper">
+                    <div class="chart-header flex flex-col md:flex-row md:items-center justify-between gap-4">
+                        <div class="flex-1">
+                            <div class="chart-title text-base font-bold text-white mb-1">Cost of solar + battery system
+                                to provide power</div>
+                            <div class="chart-subtitle text-xs text-slate-400">Description</div>
+                        </div>
+                        <!-- Inline Slider -->
+                        <div id="inline-target-cf-container"
+                            class="hidden min-w-[240px] bg-white/5 p-2 rounded-lg border border-white/10">
+                            <div class="flex justify-between items-center mb-1">
+                                <span class="text-[10px] text-gray-400 uppercase tracking-wider font-semibold">Target
+                                    Uptime</span>
+                                <span class="font-mono text-primary text-xs"><span
+                                id="target-cf-display">80</span>%</span>
+                            </div>
+                            <input type="range" id="target-cf-slider" min="50" max="99" value="80" step="1"
+                                class="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-primary hover:accent-primary/80 transition-colors">
+                        </div>
+                    </div>
+                    <div class="chart-canvas-wrapper">
+                        <canvas id="scrolly-chart"></canvas>
+                    </div>
+                </div>
+
+                <!-- Dual Chart Layout (For Section 6) -->
+                <div id="chart-layout-dual"
+                    class="hidden flex flex-col md:flex-row gap-4 w-full h-full p-4 overflow-hidden">
+                    <div id="chart-wrapper-dual-1" class="chart-wrapper flex-1 min-w-0">
+                        <div class="chart-header">
+                            <div class="chart-title" id="dual-title-1">Population</div>
+                            <div class="chart-subtitle" id="dual-subtitle-1">Description</div>
+                        </div>
+                        <div class="chart-canvas-wrapper">
+                            <canvas id="scrolly-chart-1"></canvas>
+                        </div>
+                    </div>
+                    <div id="chart-wrapper-dual-2" class="chart-wrapper flex-1 min-w-0">
+                        <div class="chart-header">
+                            <div class="chart-title" id="dual-title-2">Avg LCOE</div>
+                            <div class="chart-subtitle" id="dual-subtitle-2">Description</div>
+                        </div>
+                        <div class="chart-canvas-wrapper">
+                            <canvas id="scrolly-chart-2"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Libraries -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/d3-interpolate-path@2.3.0/build/d3-interpolate-path.js"></script>
+
+    <!-- Application Scripts -->
+    <script type="module" src="js/scrolly.js"></script>
+</body>
+
+</html>

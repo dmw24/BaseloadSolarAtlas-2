@@ -1,13 +1,13 @@
-node_modules/
-workspace/
 .DS_Store
-*.log
+.vite/
 
-# Large data and backups
-deployment/BACKUP_20260111/
-deployment/OLD/
-deployment/data/samples/
-frontend/OLD/
-scrollytelling/data
-**/index.lock
+# Local workspaces and archives (not for GitHub)
+workspace/
+tool/OLD/
 
+# Node tooling
+tool/latest/node_modules/
+tool/latest/.vite/
+
+# Legacy content parked inside latest (keep local only)
+tool/latest/deployment/OLD/
