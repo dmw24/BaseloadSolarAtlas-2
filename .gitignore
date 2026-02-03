@@ -3,11 +3,8 @@
 
 # Local workspaces and archives (not for GitHub)
 workspace/
-tool/OLD/
+deployment/OLD/
 
 # Node tooling
-tool/latest/node_modules/
-tool/latest/.vite/
-
-# Legacy content parked inside latest (keep local only)
-tool/latest/deployment/OLD/
+node_modules/
+.vite/
