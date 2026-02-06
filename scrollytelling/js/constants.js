@@ -60,3 +60,18 @@ export const POTENTIAL_TOTAL_COLORS = [
     '#1F7A4E',
     '#14532d'
 ];
+
+/**
+ * Feature flags used for staged rollout of browser performance optimizations.
+ *
+ * Rollout order:
+ * 1) config index (always-on helper, no flag)
+ * 2) FEATURE_VORONOI_REUSE
+ * 3) FEATURE_STAGED_PRELOAD (scrollytelling)
+ * 4) FEATURE_WORKER_LCOE
+ * 5) FEATURE_FRAMECACHE (scrollytelling)
+ */
+export const FEATURE_WORKER_LCOE = false;
+export const FEATURE_STAGED_PRELOAD = true;
+export const FEATURE_VORONOI_REUSE = true;
+export const FEATURE_FRAMECACHE = false;

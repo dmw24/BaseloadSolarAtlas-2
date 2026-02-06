@@ -26,6 +26,89 @@
     font-family: 'Inter', sans-serif;
 }
 
+#map-shell {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    display: block;
+}
+
+/* Population charts overlay should sit centered between demand/supply panels */
+.population-charts-shell {
+    padding-left: var(--charts-left-pad, 1.5rem);
+    padding-right: var(--charts-right-pad, 1.5rem);
+}
+
+.population-charts-inner {
+    width: 100%;
+    margin-left: auto;
+    margin-right: auto;
+}
+
+.map-pane {
+    width: 100%;
+    height: 100%;
+    position: relative;
+    flex: 1 1 0;
+    min-width: 0;
+}
+
+/* Collapsible Panels */
+.panel-collapsible {
+    transition: width 0.2s ease, padding 0.2s ease, opacity 0.2s ease;
+}
+
+.panel-collapsible.is-collapsed {
+    width: 3rem;
+    padding: 0.75rem 0.5rem;
+}
+
+.panel-collapsible.is-collapsed .panel-body,
+.panel-collapsible.is-collapsed .panel-title {
+    display: none;
+}
+
+.panel-collapsible.is-collapsed .panel-header {
+    justify-content: center;
+}
+
+.panel-collapse-btn .material-symbols-outlined {
+    transition: transform 0.2s ease;
+}
+
+.panel-collapsible.is-collapsed .panel-collapse-btn .material-symbols-outlined {
+    transform: rotate(180deg);
+}
+
+#map-supply {
+    display: none;
+}
+
+body.split-maps #map-shell {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+body.split-maps #map {
+    width: 100%;
+}
+
+body.split-maps #map-supply {
+    display: block;
+    width: 100%;
+}
+
+#legend-stack {
+    right: 1rem;
+    left: auto;
+}
+
+body.split-maps #legend-stack {
+    left: 1rem;
+    right: auto;
+    align-items: flex-start;
+}
+
 /* Custom Marker Styles if needed */
 .marker-cluster-small {
     background-color: rgba(168, 199, 250, 0.6);
@@ -153,4 +236,10 @@
 /* Map Transitions */
 .transition-color {
     transition: fill 0.9s ease, stroke 0.9s ease;
+}
+
+.voronoi-hover {
+    stroke: #ffffff !important;
+    stroke-width: 1.2 !important;
+    stroke-opacity: 1 !important;
 }

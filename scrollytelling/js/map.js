@@ -7,7 +7,8 @@ import {
     ACCESS_COLOR_SCALE,
     POPULATION_COLOR_SCALE,
     POTENTIAL_MULTIPLE_BUCKETS,
-    POTENTIAL_TOTAL_COLORS
+    POTENTIAL_TOTAL_COLORS,
+    FEATURE_VORONOI_REUSE
 } from './constants.js';
 import { createSharedPopup, buildTooltipHtml, buildCfTooltip, buildPlantTooltip } from './tooltip.js';
 
@@ -43,6 +44,25 @@ const colorScale = d3.scaleLinear()
 
 function getColor(cf) {
     return colorScale(cf);
+}
+
+function startMapPerf(label, meta = {}) {
+    const startHeap = performance?.memory?.usedJSHeapSize;
+    return { label, meta, startMs: performance.now(), startHeap };
+}
+
+function endMapPerf(marker, extra = {}) {
+    if (!marker) return;
+    const endHeap = performance?.memory?.usedJSHeapSize;
+    const heapDeltaMb = Number.isFinite(marker.startHeap) && Number.isFinite(endHeap)
+        ? (endHeap - marker.startHeap) / 1048576
+        : null;
+    console.debug(`[perf] ${marker.label}`, {
+        durationMs: Number((performance.now() - marker.startMs).toFixed(2)),
+        heapDeltaMb: Number.isFinite(heapDeltaMb) ? Number(heapDeltaMb.toFixed(3)) : null,
+        ...marker.meta,
+        ...extra
+    });
 }
 
 function buildPopulationScale(values) {
@@ -126,6 +146,7 @@ function getLcoeColor(row, colorInfo, colorScale) {
 }
 
 let worldGeoJSON = null;
+let voronoiClipVersion = null;
 
 export async function initMap(onLocationSelect) {
     map = L.map('map', {
@@ -172,16 +193,22 @@ export async function initMap(onLocationSelect) {
     // Store callback
     map.onLocationSelect = onLocationSelect;
 
-    try {
-        // Use a lightweight world GeoJSON (~100KB) for performance
-        const response = await fetch("https://raw.githubusercontent.com/holtzy/D3-graph-gallery/master/DATA/world.geojson");
-        if (response.ok) {
+    const worldGeoJsonSources = [
+        '../deployment/data/world.geojson',
+        'https://raw.githubusercontent.com/holtzy/D3-graph-gallery/master/DATA/world.geojson'
+    ];
+    for (const source of worldGeoJsonSources) {
+        try {
+            const response = await fetch(source);
+            if (!response.ok) continue;
             worldGeoJSON = await response.json();
-        } else {
-            console.error("Failed to load GeoJSON:", response.statusText);
+            break;
+        } catch (_) {
+            // Try next source.
         }
-    } catch (err) {
-        console.error("Could not load world GeoJSON data:", err);
+    }
+    if (!worldGeoJSON) {
+        console.error('Could not load world GeoJSON data from local or remote sources.');
     }
 }
 
@@ -329,14 +356,10 @@ export function updateMap(data, solarGw, battGwh, options = {}) {
     const strokeColor = options.stroke || "rgba(255,255,255,0.08)";
     const strokeWidth = Number.isFinite(options.strokeWidth) ? options.strokeWidth : 0.5;
 
-    // Filter data for current config
-    console.log(`Filtering for Solar: ${solarGw} (type: ${typeof solarGw}), Batt: ${battGwh} (type: ${typeof battGwh})`);
-    const filtered = data.filter(d => d.solar_gw === solarGw && d.batt_gwh === battGwh);
-    console.log("Filtered rows:", filtered.length);
-
-    if (filtered.length === 0 && data.length > 0) {
-        console.log("Sample row solar_gw type:", typeof data[0].solar_gw);
-    }
+    // Allow callers to pass a pre-filtered config slice to avoid hot-path full scans.
+    const filtered = options.preFiltered === true
+        ? data
+        : data.filter(d => d.solar_gw === solarGw && d.batt_gwh === battGwh);
 
     if (filtered.length === 0) {
         const avgEl = document.getElementById('stat-avg-cf');
@@ -684,7 +707,7 @@ export function updatePopulationSimple(popData, { baseLayer = 'population', over
     const popValues = popData.map(p => p.population_2020 || 0);
     const popScale = buildPopulationScale(popValues);
 
-    // Electricity scale (log scale, black to white like population)
+    // Electricity scale (linear scale, black to white like population)
     let demandScale = null;
     if (baseLayer === 'electricity' && electricityDemandData && electricityDemandData.length > 0) {
         const demands = electricityDemandData.map(d => d.annual_demand_kwh || 0).filter(v => v > 0);
@@ -692,7 +715,7 @@ export function updatePopulationSimple(popData, { baseLayer = 'population', over
             const minD = d3.min(demands);
             const maxD = d3.max(demands);
             // Use same scale as population: interpolateGreys inverted (black = low, white = high)
-            demandScale = d3.scaleSequentialLog(t => d3.interpolateGreys(1 - t)).domain([minD, maxD]);
+            demandScale = d3.scaleSequential(t => d3.interpolateGreys(1 - t)).domain([minD, maxD]);
         }
     }
 
@@ -1594,12 +1617,20 @@ export function updateCfMap(cfData, options = {}) {
 
 function renderVoronoi(mapPoints, data, fillAccessor, options = {}) {
     const { enableHoverSelect = true, ripple = false } = options;
+    const perf = startMapPerf('scrolly-render-voronoi', {
+        mode: currentMode,
+        points: mapPoints?.length || 0,
+        reuse: FEATURE_VORONOI_REUSE
+    });
     const svg = d3.select(voronoiLayer._container);
-    svg.selectAll("*").remove();
+    if (!FEATURE_VORONOI_REUSE) {
+        svg.selectAll("*").remove();
+    }
 
     // If only one point, just a circle
     if (mapPoints.length === 1) {
         // ... (simplified for now, or just skip)
+        endMapPerf(perf, { rendered: 0, skipped: true });
         return;
     }
 
@@ -1611,22 +1642,34 @@ function renderVoronoi(mapPoints, data, fillAccessor, options = {}) {
             },
         });
         const path = d3.geoPath().projection(transform);
+        const size = map.getSize();
+        const center = map.getCenter();
+        const nextClipVersion = `${size.x}x${size.y}|${map.getZoom()}|${center.lat.toFixed(3)},${center.lng.toFixed(3)}`;
+        const shouldRefreshClip = !FEATURE_VORONOI_REUSE || voronoiClipVersion !== nextClipVersion || svg.select('#clip-land').empty();
 
-        // Remove existing defs to avoid duplicates/stale clips
-        svg.select("defs").remove();
-
-        const defs = svg.append("defs");
-        defs
-            .append("clipPath")
-            .attr("id", "clip-land")
-            .append("path")
-            .datum(worldGeoJSON)
-            .attr("d", path);
+        if (shouldRefreshClip) {
+            let defs = svg.select('defs');
+            if (defs.empty()) {
+                defs = svg.append('defs');
+            }
+            let clipPath = defs.select('#clip-land');
+            if (clipPath.empty()) {
+                clipPath = defs.append('clipPath').attr('id', 'clip-land');
+                clipPath.append('path');
+            }
+            clipPath.select('path')
+                .datum(worldGeoJSON)
+                .attr('d', path);
+            voronoiClipVersion = nextClipVersion;
+        }
     }
 
-    const g = svg.append("g")
-        .attr("class", `voronoi-group${options.groupPulse ? ' intro-breathe' : ''}`)
-        .attr("clip-path", worldGeoJSON ? "url(#clip-land)" : null);
+    let g = FEATURE_VORONOI_REUSE ? svg.select('g.voronoi-group') : d3.select(null);
+    if (g.empty()) {
+        g = svg.append('g');
+    }
+    g.attr('class', `voronoi-group${options.groupPulse ? ' intro-breathe' : ''}`)
+        .attr('clip-path', worldGeoJSON ? 'url(#clip-land)' : null);
 
     if (options.groupFade) {
         const durationMs = Number.isFinite(options.groupFade.durationMs) ? options.groupFade.durationMs : 1200;
@@ -1648,6 +1691,17 @@ function renderVoronoi(mapPoints, data, fillAccessor, options = {}) {
     const buffer = Math.max(size.x, size.y);
     const bounds = [-buffer, -buffer, size.x + buffer, size.y + buffer];
     const voronoi = delaunay.voronoi(bounds);
+    const cellsData = data.map((row, i) => {
+        const key = Number.isFinite(row.location_id)
+            ? `id:${row.location_id}`
+            : `coord:${row.latitude.toFixed(4)},${row.longitude.toFixed(4)}`;
+        return {
+            key,
+            row,
+            i,
+            path: voronoi.renderCell(i)
+        };
+    });
 
     const fireMarkerEvent = (row, eventName) => {
         const marker = row && row.__hitMarker;
@@ -1680,16 +1734,23 @@ function renderVoronoi(mapPoints, data, fillAccessor, options = {}) {
     }
     const xRange = maxX - minX || 1;
 
-    svg.append("g")
-        .attr("clip-path", worldGeoJSON ? "url(#clip-land)" : null)
-        .selectAll("path")
-        .data(data)
-        .enter()
-        .append("path")
-        .attr("d", (_, i) => voronoi.renderCell(i))
-        .attr("class", "transition-color voronoi-cell leaflet-interactive")
-        .attr("data-loc-id", d => d.location_id)
-        .each(function (d, i) {
+    let paths = g.selectAll('path.voronoi-cell');
+    paths = FEATURE_VORONOI_REUSE
+        ? paths.data(cellsData, d => d.key)
+        : paths.data(cellsData);
+
+    paths.exit().remove();
+
+    const enterPaths = paths.enter()
+        .append('path')
+        .attr('class', 'transition-color voronoi-cell leaflet-interactive');
+
+    const mergedPaths = enterPaths.merge(paths)
+        .attr('d', d => d.path)
+        .attr('data-loc-id', d => d.row.location_id)
+        .style('pointer-events', 'all')
+        .each(function (cell) {
+            const d = cell.row;
             const el = d3.select(this);
             const style = fillAccessor ? fillAccessor(d) : null;
             if (style && typeof style === 'object') {
@@ -1704,43 +1765,52 @@ function renderVoronoi(mapPoints, data, fillAccessor, options = {}) {
                     .attr("stroke-width", 0.5);
             }
 
-            if (options.fadeIn) {
+            const isFreshPath = this.__voronoiInit !== true;
+            this.__voronoiInit = true;
+
+            if (options.fadeIn && isFreshPath) {
                 const durationMs = Number.isFinite(options.fadeIn.durationMs) ? options.fadeIn.durationMs : 200;
                 const totalMs = Number.isFinite(options.fadeIn.totalMs) ? options.fadeIn.totalMs : 3000;
                 const maxDelay = Math.max(0, totalMs - durationMs);
                 const delay = options.fadeIn.random === false
-                    ? (i / Math.max(1, mapPoints.length - 1)) * maxDelay
+                    ? (cell.i / Math.max(1, mapPoints.length - 1)) * maxDelay
                     : Math.random() * maxDelay;
                 el.classed("voronoi-fade-in", true)
                     .style("opacity", 0)
                     .style("animation-duration", `${durationMs}ms`)
                     .style("animation-delay", `${delay}ms`);
+            } else {
+                el.classed("voronoi-fade-in", false).style("opacity", null).style("animation-delay", null);
             }
 
             // Apply ripple animation with staggered delay
-            if (ripple && mapPoints[i]) {
-                const xPos = mapPoints[i][0];
+            if (ripple && mapPoints[cell.i]) {
+                const xPos = mapPoints[cell.i][0];
                 const delay = ((xPos - minX) / xRange) * 2000; // 2s total wave sweep
                 el.classed("voronoi-hop", true)
                     .style("animation-delay", delay + "ms");
+            } else {
+                el.classed("voronoi-hop", false).style("animation-delay", null);
             }
         })
-        .style("pointer-events", "all")
-        .on("click", (e, d) => {
+        .on("click", (e, cell) => {
+            const d = cell.row || cell;
             if (options.onClick) {
                 options.onClick(d);
                 return;
             }
             fireMarkerEvent(d, 'click');
         })
-        .on("mouseover", (e, d) => {
+        .on("mouseover", (e, cell) => {
+            const d = cell.row || cell;
             applyHoverRim(e.currentTarget);
             if (!enableHoverSelect) return;
             if (!fireMarkerEvent(d, 'mouseover') && options.onHover) {
                 options.onHover(e, d);
             }
         })
-        .on("mouseout", (e, d) => {
+        .on("mouseout", (e, cell) => {
+            const d = cell.row || cell;
             clearHoverRim(e.currentTarget);
             if (!enableHoverSelect) return;
             if (!fireMarkerEvent(d, 'mouseout') && options.onOut) {
@@ -1762,13 +1832,16 @@ function renderVoronoi(mapPoints, data, fillAccessor, options = {}) {
 
         const idSet = new Set(locationIds.map(id => Number(id)));
         cells.each(function (d) {
-            const isHighlighted = idSet.has(Number(d.location_id));
+            const row = d?.row || d;
+            const isHighlighted = idSet.has(Number(row?.location_id));
             d3.select(this)
                 .attr("fill-opacity", isHighlighted ? 0.9 : 0.05)
                 .attr("stroke", isHighlighted ? "white" : "none")
                 .attr("stroke-width", isHighlighted ? 1 : 0);
         });
     };
+
+    endMapPerf(perf, { rendered: cellsData.length });
 }
 
 // ========== SAMPLE DAYS FUNCTIONS ==========

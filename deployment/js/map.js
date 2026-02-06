@@ -6,7 +6,8 @@ import {
     LCOE_NO_DATA_COLOR,
     ACCESS_COLOR_SCALE,
     POTENTIAL_MULTIPLE_BUCKETS,
-    POTENTIAL_TOTAL_COLORS
+    POTENTIAL_TOTAL_COLORS,
+    FEATURE_VORONOI_REUSE
 } from './constants.js';
 import { createSharedPopup, buildTooltipHtml, buildCfTooltip, buildPlantTooltip } from './tooltip.js';
 
@@ -16,7 +17,6 @@ let overlayLayer;
 let voronoiLayer;
 let markerRenderer;
 let selectedMarker = null;
-let sampleMarkers = new Map();
 let currentMode = 'capacity';
 let activeLayerMode = null;
 let lastDataIsFiltered = false;
@@ -27,15 +27,30 @@ let populationScale = null;
 const ALL_FOSSIL_FUELS = ALL_FUELS;
 const FOSSIL_COLORS = FUEL_COLORS;
 
+let supplyMap;
+let supplyMarkersLayer;
+let supplyOverlayLayer;
+let supplyVoronoiLayer;
+let supplyMarkerRenderer;
+let supplyPopup = null;
+let dualMapEnabled = false;
+let syncingMaps = false;
+let lastSupplyState = null;
+let demandVoronoiIndex = new Map();
+let supplyVoronoiIndex = new Map();
+let demandDataByCoord = new Map();
+let supplyDataByCoord = new Map();
+let activeDemandHoverKey = null;
+let activeSupplyHoverKey = null;
+
 const capacityMarkers = new Map();
 let capacityMarkersActive = false;
 let capacityPopup = null;
 
-let sampleMarkersActive = false;
 let samplePopup = null;
 let lastSampleVoronoiKey = null;
 
-let currentAccessMetric = 'reliability'; // 'reliability' or 'no_access'
+let currentAccessMetric = 'reliability'; // 'reliability', 'no_access', or 'no_access_pop'
 
 export function setAccessMetric(metric) {
     currentAccessMetric = metric;
@@ -59,6 +74,25 @@ const colorScale = d3.scaleLinear()
 
 function getColor(cf) {
     return colorScale(cf);
+}
+
+function startMapPerf(label, meta = {}) {
+    const startHeap = performance?.memory?.usedJSHeapSize;
+    return { label, meta, startMs: performance.now(), startHeap };
+}
+
+function endMapPerf(marker, extra = {}) {
+    if (!marker) return;
+    const endHeap = performance?.memory?.usedJSHeapSize;
+    const heapDeltaMb = Number.isFinite(marker.startHeap) && Number.isFinite(endHeap)
+        ? (endHeap - marker.startHeap) / 1048576
+        : null;
+    console.debug(`[perf] ${marker.label}`, {
+        durationMs: Number((performance.now() - marker.startMs).toFixed(2)),
+        heapDeltaMb: Number.isFinite(heapDeltaMb) ? Number(heapDeltaMb.toFixed(3)) : null,
+        ...marker.meta,
+        ...extra
+    });
 }
 
 function buildPopulationScale(values) {
@@ -145,6 +179,252 @@ function getLcoeColor(row, colorInfo, colorScale) {
 }
 
 let worldGeoJSON = null;
+let voronoiClipVersionByMap = new Map();
+let capacityCoordMap = null;
+let capacityCoordMapSource = null;
+let capacityCoordMapPopSource = null;
+
+function getCapacityCoordMap(capacityMap, popData = null) {
+    if (!capacityMap) return null;
+    if (capacityCoordMapSource === capacityMap && capacityCoordMapPopSource === popData && capacityCoordMap) {
+        return capacityCoordMap;
+    }
+    const coordMap = new Map();
+    const capacityPoints = [];
+    const capacityRows = [];
+    capacityMap.forEach(row => {
+        if (!row) return;
+        const lat = Number(row.latitude);
+        const lon = Number(row.longitude);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+        coordMap.set(roundedKey(lat, lon), row);
+        capacityPoints.push([lon, lat]);
+        capacityRows.push(row);
+    });
+
+    if (popData && popData.length && capacityPoints.length) {
+        if (typeof d3 !== 'undefined' && d3.Delaunay) {
+            const delaunay = d3.Delaunay.from(capacityPoints);
+            popData.forEach(p => {
+                if (!Number.isFinite(p.latitude) || !Number.isFinite(p.longitude)) return;
+                const key = roundedKey(p.latitude, p.longitude);
+                if (coordMap.has(key)) return;
+                const idx = delaunay.find(p.longitude, p.latitude);
+                const row = capacityRows[idx];
+                if (row) coordMap.set(key, row);
+            });
+        } else {
+            // Fallback: brute-force nearest neighbor if Delaunay isn't available
+            popData.forEach(p => {
+                if (!Number.isFinite(p.latitude) || !Number.isFinite(p.longitude)) return;
+                const key = roundedKey(p.latitude, p.longitude);
+                if (coordMap.has(key)) return;
+                let bestIdx = -1;
+                let bestDist = Infinity;
+                for (let i = 0; i < capacityPoints.length; i++) {
+                    const [lon, lat] = capacityPoints[i];
+                    const dLat = lat - p.latitude;
+                    const dLon = lon - p.longitude;
+                    const dist = dLat * dLat + dLon * dLon;
+                    if (dist < bestDist) {
+                        bestDist = dist;
+                        bestIdx = i;
+                    }
+                }
+                if (bestIdx >= 0) coordMap.set(key, capacityRows[bestIdx]);
+            });
+        }
+    }
+    capacityCoordMapSource = capacityMap;
+    capacityCoordMapPopSource = popData;
+    capacityCoordMap = coordMap;
+    return coordMap;
+}
+
+function applyHoverRim(element) {
+    if (!element) return;
+    const sel = d3.select(element);
+    if (sel.attr("data-hover-prev-stroke") === null) {
+        const prevStroke = sel.attr("stroke");
+        const prevStrokeWidth = sel.attr("stroke-width");
+        const prevStrokeOpacity = sel.attr("stroke-opacity");
+        sel.attr("data-hover-prev-stroke", prevStroke == null ? '' : prevStroke);
+        sel.attr("data-hover-prev-stroke-width", prevStrokeWidth == null ? '' : prevStrokeWidth);
+        sel.attr("data-hover-prev-stroke-opacity", prevStrokeOpacity == null ? '' : prevStrokeOpacity);
+    }
+    sel.attr("stroke", "#ffffff")
+        .attr("stroke-width", 1.2)
+        .attr("stroke-opacity", 1)
+        .classed("voronoi-hover", true);
+}
+
+function clearHoverRim(element) {
+    if (!element) return;
+    const sel = d3.select(element);
+    const prevStroke = sel.attr("data-hover-prev-stroke");
+    if (prevStroke !== null) {
+        sel.attr("stroke", prevStroke === '' ? null : prevStroke);
+    }
+    const prevStrokeWidth = sel.attr("data-hover-prev-stroke-width");
+    if (prevStrokeWidth !== null) {
+        sel.attr("stroke-width", prevStrokeWidth === '' ? null : prevStrokeWidth);
+    }
+    const prevStrokeOpacity = sel.attr("data-hover-prev-stroke-opacity");
+    if (prevStrokeOpacity !== null) {
+        sel.attr("stroke-opacity", prevStrokeOpacity === '' ? null : prevStrokeOpacity);
+    }
+    sel.attr("data-hover-prev-stroke", null)
+        .attr("data-hover-prev-stroke-width", null)
+        .attr("data-hover-prev-stroke-opacity", null)
+        .classed("voronoi-hover", false);
+}
+
+function getRowKey(row) {
+    if (!row || !Number.isFinite(row.latitude) || !Number.isFinite(row.longitude)) return null;
+    return roundedKey(row.latitude, row.longitude);
+}
+
+function ensureSupplyPopup() {
+    if (supplyPopup) return supplyPopup;
+    if (!supplyMap) return null;
+    supplyPopup = L.popup({
+        closeButton: false,
+        autoPan: false,
+        className: 'bg-transparent border-none shadow-none'
+    });
+    return supplyPopup;
+}
+
+function buildSupplyTooltipHtml(d, overlayMode, potentialState = null) {
+    if (!d) return '';
+    if (overlayMode === 'cf') {
+        return `<div class="bg-slate-900 text-white border border-slate-700 px-3 py-2 rounded text-xs max-w-xs">
+            <div class="font-semibold">CF: ${(d.annual_cf * 100).toFixed(1)}%</div>
+            <div>Solar ${d.solar_gw} MW_DC | Battery ${d.batt_gwh} MWh</div>
+        </div>`;
+    }
+    if (overlayMode === 'lcoe') {
+        const valueLine = d.meetsTarget
+            ? `LCOE: ${d.lcoe ? formatCurrency(d.lcoe) : '--'}/MWh`
+            : `LCOE: ${d.maxConfigLcoe ? `>${formatCurrency(d.maxConfigLcoe)}` : '--'}/MWh`;
+        return `<div class="bg-slate-900 text-white border border-slate-700 px-3 py-2 rounded text-xs max-w-xs">
+            <div class="font-semibold">${valueLine}</div>
+            <div>CF ${(d.annual_cf * 100).toFixed(1)}% | Solar ${d.solar_gw} MW_DC | Battery ${d.batt_gwh} MWh</div>
+        </div>`;
+    }
+    if (overlayMode === 'potential' && potentialState) {
+        const level = potentialState.level || 'level1';
+        const isMultiple = potentialState.displayMode === 'multiple';
+        const key = level === 'level2' ? 'pvout_level2_twh_y' : 'pvout_level1_twh_y';
+        const total = Number(d[key] || 0);
+        const latVal = Number(d.latitude);
+        const bounds = potentialState.latBounds;
+        const noData = bounds ? (!Number.isFinite(latVal) || latVal < bounds.min || latVal > bounds.max) : false;
+        let ratio = null;
+        let demandTwh = null;
+        let noDemand = false;
+        if (isMultiple) {
+            const demandRow = potentialState.demandMap ? potentialState.demandMap.get(d.location_id) : null;
+            const demandKwh = demandRow ? Number(demandRow.annual_demand_kwh || 0) : 0;
+            demandTwh = demandKwh > 0 ? demandKwh / 1e9 : 0;
+            ratio = demandTwh > 0 ? total / demandTwh : null;
+            noDemand = demandTwh <= 0;
+        }
+        let mainLine = '';
+        let demandLine = '';
+        if (noData) {
+            mainLine = 'No data available';
+        } else if (isMultiple && noDemand) {
+            mainLine = 'No demand data available';
+        } else if (isMultiple) {
+            mainLine = `Solar Potential / Demand: ${ratio !== null ? `${formatNumber(ratio, 2)}×` : '--'}`;
+            demandLine = `<div class="text-slate-300">Demand: ${demandTwh ? `${formatNumber(demandTwh, 2)} TWh/yr` : '0 TWh/yr'}</div>`;
+        } else {
+            mainLine = `Solar Generation Potential: ${formatNumber(total, 2)} TWh/yr`;
+        }
+        return `<div class="bg-slate-900 text-white border border-slate-700 px-3 py-2 rounded text-xs max-w-xs">
+            <div class="font-semibold">${mainLine}</div>
+            ${demandLine}
+            <div class="text-slate-300">${getPotentialLevelLabel(level)} • Assumed ${formatNumber(d.assumed_mw_per_km2, 0)} MW/km²</div>
+        </div>`;
+    }
+    return '';
+}
+
+function syncHoverToSupply(row) {
+    if (!dualMapEnabled || !supplyMap || !lastSupplyState || lastSupplyState.overlayMode === 'none') return;
+    const key = getRowKey(row);
+    if (!key) return;
+    const supplyRow = supplyDataByCoord.get(key);
+    if (!supplyRow) return;
+
+    if (activeSupplyHoverKey && activeSupplyHoverKey !== key) {
+        const prevEl = supplyVoronoiIndex.get(activeSupplyHoverKey);
+        if (prevEl) clearHoverRim(prevEl);
+    }
+    activeSupplyHoverKey = key;
+
+    const el = supplyVoronoiIndex.get(key);
+    if (el) applyHoverRim(el);
+
+    const popup = ensureSupplyPopup();
+    const html = buildSupplyTooltipHtml(supplyRow, lastSupplyState.overlayMode, lastSupplyState.potentialState);
+    if (popup && html) {
+        popup.setLatLng([supplyRow.latitude, supplyRow.longitude]).setContent(html).openOn(supplyMap);
+    }
+}
+
+function syncOutToSupply(row) {
+    if (!dualMapEnabled || !supplyMap) return;
+    const key = getRowKey(row);
+    if (key && supplyVoronoiIndex.has(key)) {
+        clearHoverRim(supplyVoronoiIndex.get(key));
+    }
+    if (activeSupplyHoverKey === key) activeSupplyHoverKey = null;
+    if (supplyPopup) {
+        supplyMap.closePopup(supplyPopup);
+    }
+}
+
+function syncHoverToDemand(row) {
+    if (!dualMapEnabled || !map) return;
+    const key = getRowKey(row);
+    if (!key) return;
+    const demandRow = demandDataByCoord.get(key);
+    if (!demandRow) return;
+
+    if (activeDemandHoverKey && activeDemandHoverKey !== key) {
+        const prevEl = demandVoronoiIndex.get(activeDemandHoverKey);
+        if (prevEl) clearHoverRim(prevEl);
+    }
+    activeDemandHoverKey = key;
+
+    const el = demandVoronoiIndex.get(key);
+    if (el) applyHoverRim(el);
+    fireMarkerEvent(demandRow, 'mouseover');
+}
+
+function syncOutToDemand(row) {
+    if (!dualMapEnabled || !map) return;
+    const key = getRowKey(row);
+    if (key && demandVoronoiIndex.has(key)) {
+        clearHoverRim(demandVoronoiIndex.get(key));
+    }
+    if (activeDemandHoverKey === key) activeDemandHoverKey = null;
+    const demandRow = demandDataByCoord.get(key);
+    if (demandRow) {
+        fireMarkerEvent(demandRow, 'mouseout');
+    }
+}
+
+function fireMarkerEvent(row, eventName) {
+    const marker = row && row.__hitMarker;
+    if (marker && typeof marker.fire === 'function') {
+        marker.fire(eventName);
+        return true;
+    }
+    return false;
+}
 
 function clearVoronoi() {
     if (!voronoiLayer) return;
@@ -159,7 +439,6 @@ function resetLayersForMode(mode, { preserveVoronoi = false } = {}) {
         if (!preserveVoronoi) clearVoronoi();
         activeLayerMode = mode;
         capacityMarkersActive = false;
-        sampleMarkersActive = false;
         selectedMarker = null;
     } else {
         if (overlayLayer) overlayLayer.clearLayers();
@@ -208,22 +487,107 @@ export async function initMap(onLocationSelect) {
         } else if (currentMode === 'samples' && lastSampleFrame) {
             updateMapWithSampleFrame(lastSampleFrame);
         }
+        if (dualMapEnabled && supplyMap && !syncingMaps) {
+            syncMapViews(map, supplyMap);
+        }
     });
 
     // Store callback
     map.onLocationSelect = onLocationSelect;
 
-    try {
-        // Use a lightweight world GeoJSON (~100KB) for performance
-        const response = await fetch("https://raw.githubusercontent.com/holtzy/D3-graph-gallery/master/DATA/world.geojson");
-        if (response.ok) {
+    initSupplyMap();
+
+    const worldGeoJsonSources = [
+        'data/world.geojson',
+        'https://raw.githubusercontent.com/holtzy/D3-graph-gallery/master/DATA/world.geojson'
+    ];
+    for (const source of worldGeoJsonSources) {
+        try {
+            const response = await fetch(source);
+            if (!response.ok) continue;
             worldGeoJSON = await response.json();
-        } else {
-            console.error("Failed to load GeoJSON:", response.statusText);
+            break;
+        } catch (_) {
+            // Try next source.
         }
-    } catch (err) {
-        console.error("Could not load world GeoJSON data:", err);
     }
+    if (!worldGeoJSON) {
+        console.error('Could not load world GeoJSON data from local or remote sources.');
+    }
+}
+
+function initSupplyMap() {
+    const container = document.getElementById('map-supply');
+    if (!container) return;
+
+    supplyMap = L.map('map-supply', {
+        zoomControl: false,
+        attributionControl: false,
+        scrollWheelZoom: false,
+        doubleClickZoom: false,
+        touchZoom: false,
+        boxZoom: false,
+        keyboard: false
+    }).setView([20, 0], 2);
+
+    supplyMarkerRenderer = L.canvas({ padding: 0.5 });
+
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+        subdomains: 'abcd',
+        maxZoom: 19
+    }).addTo(supplyMap);
+
+    supplyMarkersLayer = L.layerGroup().addTo(supplyMap);
+    supplyOverlayLayer = L.layerGroup().addTo(supplyMap);
+    supplyVoronoiLayer = L.svg().addTo(supplyMap);
+
+    supplyMap.on('moveend', () => {
+        if (dualMapEnabled && map && !syncingMaps) {
+            syncMapViews(supplyMap, map);
+        }
+        if (dualMapEnabled && lastSupplyState) {
+            updateSupplyMap(lastSupplyState);
+        }
+    });
+}
+
+function syncMapViews(sourceMap, targetMap) {
+    if (!sourceMap || !targetMap) return;
+    syncingMaps = true;
+    targetMap.setView(sourceMap.getCenter(), sourceMap.getZoom(), { animate: false });
+    setTimeout(() => {
+        syncingMaps = false;
+    }, 0);
+}
+
+export function setDualMapMode(enabled) {
+    dualMapEnabled = !!enabled;
+    if (document.body) {
+        document.body.classList.toggle('split-maps', dualMapEnabled);
+    }
+    if (!supplyMap || !map) return;
+    const syncView = () => {
+        if (dualMapEnabled) {
+            supplyMap.setView(map.getCenter(), map.getZoom(), { animate: false });
+        }
+    };
+
+    const invalidate = () => {
+        map.invalidateSize();
+        supplyMap.invalidateSize();
+        if (dualMapEnabled && lastSupplyState) {
+            updateSupplyMap(lastSupplyState);
+        }
+    };
+
+    syncView();
+    requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+            invalidate();
+            syncView();
+        });
+    });
 }
 
 let lastData = null;
@@ -336,10 +700,7 @@ export function updateMap(data, solarGw, battGwh, options = {}) {
     lastLcoeData = null;
     lastLcoeOptions = null;
 
-    if (selectedMarker) {
-        selectedMarker.setStyle({ stroke: false, color: '#fff', weight: 0, radius: 4.5, opacity: 0, fillOpacity: 0 });
-        selectedMarker = null;
-    }
+    selectedMarker = null;
 
     resetLayersForMode('capacity');
 
@@ -358,8 +719,7 @@ export function updateMap(data, solarGw, battGwh, options = {}) {
     }
 
     if (!capacityMarkersActive && capacityMarkers.size) {
-        capacityMarkers.forEach(({ dot, hit }) => {
-            dot.addTo(markersLayer);
+        capacityMarkers.forEach(({ hit }) => {
             hit.addTo(markersLayer);
         });
         capacityMarkersActive = true;
@@ -374,18 +734,6 @@ export function updateMap(data, solarGw, battGwh, options = {}) {
         let entry = capacityMarkers.get(id);
 
         if (!entry) {
-            const dot = L.circleMarker([d.latitude, d.longitude], {
-                radius: 0.8,
-                fillColor: color,
-                color: color,
-                weight: 0,
-                opacity: 1,
-                fillOpacity: 0.9,
-                pane: 'markers',
-                interactive: false,
-                renderer: markerRenderer
-            });
-
             const hit = L.circleMarker([d.latitude, d.longitude], {
                 radius: 4.5,
                 fillColor: '#fff',
@@ -398,6 +746,7 @@ export function updateMap(data, solarGw, battGwh, options = {}) {
             });
 
             hit.__data = d;
+            d.__hitMarker = hit;
 
             hit.on('mouseover', () => {
                 const row = hit.__data;
@@ -416,12 +765,6 @@ export function updateMap(data, solarGw, battGwh, options = {}) {
             hit.on('click', () => {
                 const row = hit.__data;
                 if (!row) return;
-                if (selectedMarker) {
-                    selectedMarker.setStyle({ stroke: false, color: '#fff', weight: 0, radius: 4.5, opacity: 0, fillOpacity: 0 });
-                }
-                hit.setStyle({ color: '#fff', weight: 2, radius: 6, opacity: 1 });
-                selectedMarker = hit;
-
                 const rowColor = getColor(row.annual_cf);
                 updateLocationPanel(row, rowColor, 'capacity');
 
@@ -430,17 +773,15 @@ export function updateMap(data, solarGw, battGwh, options = {}) {
                 }
             });
 
-            entry = { dot, hit };
+            entry = { hit };
             capacityMarkers.set(id, entry);
             if (activeLayerMode === 'capacity') {
-                dot.addTo(markersLayer);
                 hit.addTo(markersLayer);
             }
         } else {
             entry.hit.__data = d;
+            d.__hitMarker = entry.hit;
         }
-
-        entry.dot.setStyle({ fillColor: color, color: color, opacity: 1, fillOpacity: 0.9 });
     });
 
     capacityMarkersActive = true;
@@ -449,11 +790,9 @@ export function updateMap(data, solarGw, battGwh, options = {}) {
         capacityMarkers.forEach((entry, id) => {
             const isActive = activeIds.has(id);
             if (!isActive) {
-                entry.dot.setStyle({ opacity: 0, fillOpacity: 0 });
-                entry.hit.setStyle({ opacity: 0, fillOpacity: 0 });
+                entry.hit.setStyle({ opacity: 0, fillOpacity: 0, weight: 0 });
             } else {
-                entry.dot.setStyle({ opacity: 1, fillOpacity: 0.9 });
-                entry.hit.setStyle({ opacity: 0, fillOpacity: 0 });
+                entry.hit.setStyle({ opacity: 0, fillOpacity: 0, weight: 0 });
             }
         });
     }
@@ -593,6 +932,8 @@ export function updatePopulationSimple(popData, { baseLayer = 'population', over
 
     if (!popData || popData.length === 0) return;
 
+    demandDataByCoord = new Map(popData.map(p => [roundedKey(p.latitude, p.longitude), p]));
+
     // Build LCOE Map if needed for overlay
     let lcoeMap = null;
     if (overlayMode === 'lcoe' && lcoeData) {
@@ -607,7 +948,9 @@ export function updatePopulationSimple(popData, { baseLayer = 'population', over
 
     // Create maps from function parameters for lookup
     const capacityMap = fossilCapacityMap instanceof Map ? fossilCapacityMap : null;
+    const capacityCoordMap = capacityMap ? getCapacityCoordMap(capacityMap, popData) : null;
     const demandMap = electricityDemandMap instanceof Map ? electricityDemandMap : null;
+    const statusSuffix = selectedStatus === 'existing' ? 'Existing' : 'Announced';
 
     const formatCapacityLines = (cap) => {
         if (!cap || !selectedFuelSet.size) {
@@ -615,7 +958,7 @@ export function updatePopulationSimple(popData, { baseLayer = 'population', over
         }
         const lines = [];
         selectedFuelSet.forEach(fuel => {
-            const value = Number(cap[`${fuel}_mw`] || 0);
+            const value = Number(cap[`${fuel}_${statusSuffix}`] || 0);
             if (value > 0) {
                 lines.push(`<div>${capitalizeWord(fuel)}: ${formatNumber(value, 0)} MW</div>`);
             }
@@ -630,7 +973,7 @@ export function updatePopulationSimple(popData, { baseLayer = 'population', over
     const popValues = popData.map(p => p.population_2020 || 0);
     const popScale = buildPopulationScale(popValues);
 
-    // Electricity scale (log scale, black to white like population)
+    // Electricity scale (linear scale, black to white like population)
     let demandScale = null;
     if (baseLayer === 'electricity' && electricityDemandData && electricityDemandData.length > 0) {
         const demands = electricityDemandData.map(d => d.annual_demand_kwh || 0).filter(v => v > 0);
@@ -638,7 +981,7 @@ export function updatePopulationSimple(popData, { baseLayer = 'population', over
             const minD = d3.min(demands);
             const maxD = d3.max(demands);
             // Use same scale as population: interpolateGreys inverted (black = low, white = high)
-            demandScale = d3.scaleSequentialLog(t => d3.interpolateGreys(1 - t)).domain([minD, maxD]);
+            demandScale = d3.scaleSequential(t => d3.interpolateGreys(1 - t)).domain([minD, maxD]);
         }
     }
 
@@ -702,7 +1045,7 @@ export function updatePopulationSimple(popData, { baseLayer = 'population', over
         const key = roundedKey(d.latitude, d.longitude);
         const cfRow = cfByCoord.get(key);
         const lcoeRow = lcoeByCoord.get(key);
-        const capacity = capacityMap && d.location_id != null ? capacityMap.get(Number(d.location_id)) : null;
+        const capacity = capacityCoordMap ? capacityCoordMap.get(key) : null;
         const capacityLines = formatCapacityLines(capacity);
 
         // Determine overlay color and data
@@ -800,25 +1143,45 @@ export function updatePopulationSimple(popData, { baseLayer = 'population', over
                     ${populationLine}
                     ${capacityLines}
                  </div>`;
+                } else if (baseLayer === 'uptime') {
+                    const relKey = roundedKey(d.latitude, d.longitude, 2);
+                    const relData = reliabilityByCoord.get(relKey);
+                    const hasData = relData && relData.hrea_covered;
+                    let metricLine = '';
+                    if (hasData) {
+                        const val = relData.avg_reliability_access_only !== undefined ? relData.avg_reliability_access_only : relData.avg_reliability;
+                        metricLine = `<div class="font-semibold text-white">Grid Reliability: ${val.toFixed(1)}%</div>
+                                      <div class="text-[10px] text-slate-400">Share of time the local grid is operational</div>`;
+                    } else {
+                        metricLine = `<div class="font-semibold text-slate-400">Grid Reliability: No data available</div>`;
+                    }
+                    content = `<div class="bg-slate-900 text-white border border-slate-700 px-3 py-2 rounded text-xs max-w-xs">
+                    ${metricLine}
+                    ${populationLine}
+                 </div>`;
                 } else if (overlayMode === 'access' || baseLayer === 'access') {
                     // Access mode - show reliability (use 2 decimals for lookup)
                     const relKey = roundedKey(d.latitude, d.longitude, 2);
                     const relData = reliabilityByCoord.get(relKey);
 
-                    const hasData = relData && relData.hrea_covered;
-                    const hreaCovered = relData ? (relData.hrea_covered ? 'Yes' : 'No') : '--';
+            const hasData = relData && relData.hrea_covered;
+            const hreaCovered = relData ? (relData.hrea_covered ? 'Yes' : 'No') : '--';
 
-                    let metricLine = '';
-                    if (hasData) {
-                        const relVal = (relData.avg_reliability_access_only || 0).toFixed(1) + '%';
-                        const noAccessVal = ((relData.pct_no_access || 0) * 100).toFixed(1) + '%';
+            let metricLine = '';
+            if (hasData) {
+                const relVal = (relData.avg_reliability_access_only || 0).toFixed(1) + '%';
+                const noAccessVal = ((relData.pct_no_access || 0) * 100).toFixed(1) + '%';
 
-                        // Highlight the active metric
-                        if (currentAccessMetric === 'no_access') {
-                            metricLine = `<div class="font-semibold">No Access: ${noAccessVal}</div>
+                // Highlight the active metric
+                if (currentAccessMetric === 'no_access_pop') {
+                    const popNoAccess = (relData.total_pop_reliability || 0) * (relData.pct_no_access || 0);
+                    metricLine = `<div class="font-semibold">Without Access: ${(popNoAccess / 1e6).toFixed(2)} million</div>
+                                   <div class="text-slate-400 text-[10px]">Percentage: ${noAccessVal}</div>`;
+                } else if (currentAccessMetric === 'no_access') {
+                    metricLine = `<div class="font-semibold">No Access: ${noAccessVal}</div>
                                            <div class="text-slate-400 text-[10px]">Grid Reliability (connected): ${relVal}</div>`;
-                        } else {
-                            metricLine = `<div class="font-semibold">Grid Reliability: ${relVal}</div>
+                } else {
+                    metricLine = `<div class="font-semibold">Grid Reliability: ${relVal}</div>
                                            <div class="text-slate-400 text-[10px]">No Access: ${noAccessVal}</div>`;
                         }
                     } else {
@@ -846,12 +1209,6 @@ export function updatePopulationSimple(popData, { baseLayer = 'population', over
             });
 
             marker.on('click', () => {
-                if (selectedMarker) {
-                    selectedMarker.setStyle({ stroke: false, color: '#000', weight: 1, radius: 4 });
-                }
-                marker.setStyle({ color: '#fff', weight: 2, radius: 6 });
-                selectedMarker = marker;
-
                 updateLocationPanel({
                     ...d,
                     ...(overlayData || {}),
@@ -865,6 +1222,7 @@ export function updatePopulationSimple(popData, { baseLayer = 'population', over
                 }
             });
 
+            d.__hitMarker = marker;
             marker.addTo(markersLayer);
         }
     });
@@ -916,13 +1274,37 @@ export function updatePopulationSimple(popData, { baseLayer = 'population', over
 
     // Define base layer fill function (demand layer)
     const baseFill = (d) => {
+        if (baseLayer === 'uptime') {
+            // Grid Reliability (Red -> Grey)
+            const relKey = roundedKey(d.latitude, d.longitude, 2);
+            const rel = reliabilityByCoord.get(relKey);
+
+            if (!rel || !rel.hrea_covered) return '#1e293b'; // No data
+
+            const gridUptime = rel.avg_reliability_access_only !== undefined ? rel.avg_reliability_access_only : rel.avg_reliability;
+            return d3.scaleLinear()
+                .domain([0, 100])
+                .range(["#ef4444", "#6b7280"])
+                .clamp(true)
+                (gridUptime);
+        }
         if (baseLayer === 'access') {
             // Use coordinate-based lookup with 2 decimals to match source data
             const relKey = roundedKey(d.latitude, d.longitude, 2);
             const rel = reliabilityByCoord.get(relKey);
 
-            if (!rel) return '#334155'; // No record found -> Slate 700
-            if (!rel.hrea_covered) return '#334155'; // No HREA coverage -> Slate 700 (No Data)
+            if (currentAccessMetric === 'no_access_pop') {
+                const popNoAccess = (rel && rel.hrea_covered) ? (rel.total_pop_reliability || 0) * (rel.pct_no_access || 0) : 0;
+                if (popNoAccess <= 0) return '#111827'; // Darkest grey for universal access
+                return d3.scaleLog()
+                    .domain([100, 10000, 1000000])
+                    .range(["#1e293b", "#991b1b", "#ff0000"])
+                    .clamp(true)
+                    (Math.max(1, popNoAccess));
+            }
+
+            if (!rel) return '#1e293b'; // No data
+            if (!rel.hrea_covered) return '#1e293b';
 
             // Determine value based on metric
             let val = 0;
@@ -930,17 +1312,20 @@ export function updatePopulationSimple(popData, { baseLayer = 'population', over
                 // High no access (1.0) -> Bad (Red). Low no access (0.0) -> Good (Green).
                 // Scale expects 0->Red, 100->Green.
                 // Map: 1 - pct (0..1) -> 0..1 * 100 -> 0..100.
-                val = (1 - (rel.pct_no_access || 0)) * 100;
+                const pct = rel.pct_no_access || 0;
+                if (pct <= 0) return 'rgba(0,0,0,0)'; // Hide if everyone has access
+                val = (1 - pct) * 100;
             } else {
                 // Reliability: 0->Red (Low), 100->Green (High)
                 // Use access_only metric if available, else standard
                 val = rel.avg_reliability_access_only !== undefined ? rel.avg_reliability_access_only : rel.avg_reliability;
             }
 
-            // Scale 0-100 -> color (Red low, Yellow mid, Green high)
+            // Scale 0-100 -> color (Red low -> Grey high) to match scrollytelling uptime map
             return d3.scaleLinear()
-                .domain(ACCESS_COLOR_SCALE.domain)
-                .range(ACCESS_COLOR_SCALE.range)
+                .domain([0, 100])
+                .range(["#ef4444", "#6b7280"])
+                .clamp(true)
                 (val);
         } else if (baseLayer === 'electricity') {
             const key = roundedKey(d.latitude, d.longitude);
@@ -950,9 +1335,11 @@ export function updatePopulationSimple(popData, { baseLayer = 'population', over
                 return demandScale(val);
             }
             return '#1e293b'; // slate-800 for no data
-        } else if (baseLayer === 'population' || baseLayer === 'plants') {
+        } else if (baseLayer === 'population') {
             const popVal = d.population_2020 || 0;
             return popScale(popVal);
+        } else if (baseLayer === 'plants') {
+            return 'rgba(0,0,0,0)';
         }
         return 'rgba(0,0,0,0)';
     };
@@ -964,22 +1351,34 @@ export function updatePopulationSimple(popData, { baseLayer = 'population', over
         const lcoeRow = lcoeByCoord.get(key);
 
         if (overlayMode === 'access') {
-            const rel = reliabilityByCoord.get(key);
-            if (!rel) return '#334155';
-            if (!rel.hrea_covered) return '#334155'; // No Data
+            const relKey = roundedKey(d.latitude, d.longitude, 2);
+            const rel = reliabilityByCoord.get(relKey);
+            if (!rel) return '#1e293b';
+            if (!rel.hrea_covered) return '#1e293b'; // No Data
 
             // Determine value based on metric
             let val = 0;
-            if (currentAccessMetric === 'no_access') {
-                val = (1 - (rel.pct_no_access || 0)) * 100;
+            if (currentAccessMetric === 'no_access_pop') {
+                const popNoAccess = (rel.total_pop_reliability || 0) * (rel.pct_no_access || 0);
+                if (popNoAccess <= 0) return '#111827';
+                return d3.scaleLog()
+                    .domain([100, 10000, 1000000])
+                    .range(["#1e293b", "#991b1b", "#ff0000"])
+                    .clamp(true)
+                    (Math.max(1, popNoAccess));
+            } else if (currentAccessMetric === 'no_access') {
+                const pct = rel.pct_no_access || 0;
+                if (pct <= 0) return 'rgba(0,0,0,0)'; // Hide if everyone has access
+                val = (1 - pct) * 100;
             } else {
                 val = rel.avg_reliability_access_only !== undefined ? rel.avg_reliability_access_only : rel.avg_reliability;
             }
 
-            // Scale 0-100 -> color (Red low, Yellow mid, Green high)
+            // Scale 0-100 -> color (Red low -> Grey high) to match scrollytelling uptime map
             return d3.scaleLinear()
-                .domain(ACCESS_COLOR_SCALE.domain)
-                .range(ACCESS_COLOR_SCALE.range)
+                .domain([0, 100])
+                .range(["#ef4444", "#6b7280"])
+                .clamp(true)
                 (val);
         } else if (overlayMode === 'cf' && cfRow && Number.isFinite(cfRow.annual_cf)) {
             return getColor(cfRow.annual_cf);
@@ -993,17 +1392,141 @@ export function updatePopulationSimple(popData, { baseLayer = 'population', over
     renderVoronoiDual(voronoiPoints, popData, baseFill, overlayFill);
 }
 
-function renderVoronoiDual(mapPoints, data, baseFill, overlayFill) {
+export function updateSupplyMap({ overlayMode = 'none', cfData = [], lcoeData = [], lcoeColorInfo = null, potentialState = null } = {}) {
+    if (!supplyMap || !supplyVoronoiLayer) return;
+    lastSupplyState = { overlayMode, cfData, lcoeData, lcoeColorInfo, potentialState };
+
+    if (supplyMarkersLayer) supplyMarkersLayer.clearLayers();
+    if (supplyOverlayLayer) supplyOverlayLayer.clearLayers();
+    d3.select(supplyVoronoiLayer._container).selectAll("*").remove();
+
+    if (overlayMode === 'none') {
+        supplyDataByCoord = new Map();
+        supplyVoronoiIndex = new Map();
+        activeSupplyHoverKey = null;
+        if (supplyPopup) {
+            supplyMap.closePopup(supplyPopup);
+        }
+        return;
+    }
+
+    const data = overlayMode === 'cf'
+        ? cfData
+        : overlayMode === 'lcoe'
+            ? lcoeData
+            : overlayMode === 'potential'
+                ? (potentialState?.data || [])
+                : [];
+    if (!data || data.length === 0) return;
+
+    supplyDataByCoord = new Map(data.map(d => [roundedKey(d.latitude, d.longitude), d]));
+
+    const potentialKey = potentialState?.level === 'level2' ? 'pvout_level2_twh_y' : 'pvout_level1_twh_y';
+    const potentialIsMultiple = potentialState?.displayMode === 'multiple';
+    const potentialNoDataColor = '#6b7280';
+    const potentialScale = overlayMode === 'potential' && potentialState && potentialState.valueCount
+        ? (potentialIsMultiple
+            ? (val) => {
+                const value = Number.isFinite(val) ? val : 0;
+                for (const bucket of POTENTIAL_MULTIPLE_BUCKETS) {
+                    if (bucket.max === null || value < bucket.max) {
+                        return bucket.color;
+                    }
+                }
+                return POTENTIAL_MULTIPLE_BUCKETS[POTENTIAL_MULTIPLE_BUCKETS.length - 1].color;
+            }
+            : d3.scaleSequential(d3.interpolateRgbBasis(POTENTIAL_TOTAL_COLORS))
+                .domain([potentialState.min, potentialState.max])
+                .clamp(true))
+        : null;
+
+    const colorScale = overlayMode === 'lcoe' && lcoeColorInfo
+        ? buildLcoeColorScaleFromInfo(lcoeColorInfo)
+        : null;
+
+    const getFill = (row) => {
+        if (overlayMode === 'cf') {
+            return getColor(row.annual_cf);
+        }
+        if (overlayMode === 'lcoe' && lcoeColorInfo && colorScale) {
+            return getLcoeColor(row, lcoeColorInfo, colorScale);
+        }
+        if (overlayMode === 'potential' && potentialState && potentialScale) {
+            const totalVal = Number(row[potentialKey] || 0);
+            const latVal = Number(row.latitude);
+            const bounds = potentialState.latBounds;
+            if (bounds && (!Number.isFinite(latVal) || latVal < bounds.min || latVal > bounds.max)) {
+                return potentialNoDataColor;
+            }
+            let value = totalVal;
+            if (potentialIsMultiple) {
+                const demandRow = potentialState.demandMap ? potentialState.demandMap.get(row.location_id) : null;
+                const demandKwh = demandRow ? Number(demandRow.annual_demand_kwh || 0) : 0;
+                const demandTwh = demandKwh > 0 ? demandKwh / 1e9 : 0;
+                if (demandTwh <= 0) return potentialNoDataColor;
+                value = totalVal / demandTwh;
+            }
+            return potentialScale(value || 0);
+        }
+        return 'rgba(0,0,0,0)';
+    };
+
+    ensureSupplyPopup();
+
+    let lastSupplyHoverRow = null;
+
+    const onHover = (e, d) => {
+        const content = buildSupplyTooltipHtml(d, overlayMode, potentialState);
+        if (content && supplyPopup) {
+            supplyPopup.setLatLng([d.latitude, d.longitude]).setContent(content).openOn(supplyMap);
+        }
+        lastSupplyHoverRow = d;
+        syncHoverToDemand(d);
+    };
+
+    const onOut = () => {
+        if (supplyPopup) {
+            supplyMap.closePopup(supplyPopup);
+        }
+        if (lastSupplyHoverRow) {
+            syncOutToDemand(lastSupplyHoverRow);
+            lastSupplyHoverRow = null;
+        }
+    };
+
+    const mapPoints = data.map(d => {
+        const point = supplyMap.latLngToLayerPoint([d.latitude, d.longitude]);
+        return [point.x, point.y];
+    });
+
+    renderVoronoi(
+        mapPoints,
+        data,
+        (row) => getFill(row),
+        {
+            enableHoverSelect: true,
+            useMarkerEvents: false,
+            onHover,
+            onOut,
+            context: { map: supplyMap, voronoiLayer: supplyVoronoiLayer }
+        }
+    );
+}
+
+function renderVoronoiDual(mapPoints, data, baseFill, overlayFill, options = {}) {
     const svg = d3.select(voronoiLayer._container);
     svg.selectAll("*").remove();
 
     if (mapPoints.length <= 1) return;
+
+    demandVoronoiIndex = new Map();
 
     const hasBase = typeof baseFill === 'function';
     const hasOverlay = typeof overlayFill === 'function';
     if (!hasBase && !hasOverlay) return;
 
     let path = null;
+    const clipId = map._leaflet_id ? `clip-land-${map._leaflet_id}` : 'clip-land-main';
     if (worldGeoJSON) {
         const transform = d3.geoTransform({
             point: function (x, y) {
@@ -1017,13 +1540,13 @@ function renderVoronoiDual(mapPoints, data, baseFill, overlayFill) {
         const defs = svg.append("defs");
         defs
             .append("clipPath")
-            .attr("id", "clip-land")
+            .attr("id", clipId)
             .append("path")
             .datum(worldGeoJSON)
             .attr("d", path);
     }
 
-    const clip = worldGeoJSON ? "url(#clip-land)" : null;
+    const clip = worldGeoJSON ? `url(#${clipId})` : null;
     const size = map.getSize();
     const buffer = Math.max(size.x, size.y);
     const bounds = [-buffer, -buffer, size.x + buffer, size.y + buffer];
@@ -1033,6 +1556,25 @@ function renderVoronoiDual(mapPoints, data, baseFill, overlayFill) {
     // When both layers are present, use lower opacity so overlap is visible
     const baseOpacity = hasOverlay ? 0.5 : 0.85;
     const overlayOpacity = hasBase ? 0.5 : 0.35;
+
+    const handleOver = function (e, d) {
+        applyHoverRim(this);
+        fireMarkerEvent(d, 'mouseover');
+        syncHoverToSupply(d);
+        if (options.onHover) options.onHover(e, d);
+    };
+
+    const handleOut = function (e, d) {
+        clearHoverRim(this);
+        fireMarkerEvent(d, 'mouseout');
+        syncOutToSupply(d);
+        if (options.onOut) options.onOut(e, d);
+    };
+
+    const handleClick = function (e, d) {
+        fireMarkerEvent(d, 'click');
+        if (options.onClick) options.onClick(e, d);
+    };
 
     if (hasBase) {
         const base = svg.append("g").attr("clip-path", clip);
@@ -1046,8 +1588,25 @@ function renderVoronoiDual(mapPoints, data, baseFill, overlayFill) {
             .attr("fill-opacity", baseOpacity)
             .attr("stroke", "rgba(255,255,255,0.08)")
             .attr("stroke-width", 0.5)
-            .attr("class", "transition-color")
-            .style("pointer-events", "none");
+            .attr("class", "transition-color voronoi-cell leaflet-interactive")
+            .style("pointer-events", hasOverlay ? "none" : "all")
+            .each(function (d) {
+                if (hasOverlay) return;
+                const key = getRowKey(d);
+                if (key) demandVoronoiIndex.set(key, this);
+            })
+            .on("mouseover", function (e, d) {
+                if (hasOverlay) return;
+                handleOver.call(this, e, d);
+            })
+            .on("mouseout", function (e, d) {
+                if (hasOverlay) return;
+                handleOut.call(this, e, d);
+            })
+            .on("click", function (e, d) {
+                if (hasOverlay) return;
+                handleClick.call(this, e, d);
+            });
     }
 
     if (hasOverlay) {
@@ -1062,8 +1621,21 @@ function renderVoronoiDual(mapPoints, data, baseFill, overlayFill) {
             .attr("fill", d => overlayFill(d) || "rgba(0,0,0,0)")
             .attr("fill-opacity", overlayOpacity)
             .attr("stroke", "none")
-            .attr("class", "transition-color")
-            .style("pointer-events", "none");
+            .attr("class", "transition-color voronoi-cell leaflet-interactive")
+            .style("pointer-events", "all")
+            .each(function (d) {
+                const key = getRowKey(d);
+                if (key) demandVoronoiIndex.set(key, this);
+            })
+            .on("mouseover", function (e, d) {
+                handleOver.call(this, e, d);
+            })
+            .on("mouseout", function (e, d) {
+                handleOut.call(this, e, d);
+            })
+            .on("click", function (e, d) {
+                handleClick.call(this, e, d);
+            });
     }
 }
 
@@ -1225,19 +1797,6 @@ export function updatePotentialMap(potentialData, { level = 'level1', min = null
             ? noDataColor
             : colorScale(displayValue || 0);
 
-        // Visual marker
-        L.circleMarker([d.latitude, d.longitude], {
-            radius: 0.8,
-            fillColor: color,
-            color: color,
-            weight: 0,
-            opacity: 1,
-            fillOpacity: 0.9,
-            pane: 'markers',
-            interactive: false,
-            renderer: markerRenderer
-        }).addTo(markersLayer);
-
         const marker = L.circleMarker([d.latitude, d.longitude], {
             radius: 6,
             fillColor: '#fff',
@@ -1275,12 +1834,6 @@ export function updatePotentialMap(potentialData, { level = 'level1', min = null
         });
 
         marker.on('click', () => {
-            if (selectedMarker) {
-                selectedMarker.setStyle({ stroke: false, color: '#000', weight: 1, radius: 4 });
-            }
-            marker.setStyle({ color: '#fff', weight: 2, radius: 6 });
-            selectedMarker = marker;
-
             updateLocationPanel({
                 ...d,
                 potential_twh: total,
@@ -1306,6 +1859,7 @@ export function updatePotentialMap(potentialData, { level = 'level1', min = null
             }
         });
 
+        d.__hitMarker = marker;
         marker.addTo(markersLayer);
     });
 
@@ -1329,7 +1883,7 @@ export function updatePotentialMap(potentialData, { level = 'level1', min = null
             value = totalVal / demandTwh;
         }
         return colorScale(value || 0);
-    }, { enableHoverSelect: false });
+    });
 }
 
 export function updateLcoeMap(bestData, options = {}) {
@@ -1362,19 +1916,6 @@ export function updateLcoeMap(bestData, options = {}) {
         if (d.meetsTarget) {
             color = getLcoeColor(d, colorInfo, colorScale);
         }
-
-        // Visual marker
-        L.circleMarker([d.latitude, d.longitude], {
-            radius: 0.8,
-            fillColor: color,
-            color: color,
-            weight: 0,
-            opacity: 1,
-            fillOpacity: 0.9,
-            pane: 'markers',
-            interactive: false,
-            renderer: markerRenderer
-        }).addTo(markersLayer);
 
         // Hit marker
         const marker = L.circleMarker([d.latitude, d.longitude], {
@@ -1431,12 +1972,6 @@ ${distanceLine}`;
         });
 
         marker.on('click', () => {
-            if (selectedMarker) {
-                selectedMarker.setStyle({ stroke: false, color: '#000', weight: 1, radius: 4 });
-            }
-            marker.setStyle({ color: '#fff', weight: 2, radius: 6 });
-            selectedMarker = marker;
-
             updateLocationPanel({ ...d, targetCf, comparisonMetric: metricMode }, color, 'lcoe');
 
             if (map.onLocationSelect) {
@@ -1444,12 +1979,7 @@ ${distanceLine}`;
             }
         });
 
-        // Highlight reference if present
-        if (reference && reference.location_id === d.location_id) {
-            marker.setStyle({ color: '#f59e0b', weight: 3, radius: 6, opacity: 1 });
-            selectedMarker = marker;
-        }
-
+        d.__hitMarker = marker;
         marker.addTo(markersLayer);
     });
 
@@ -1469,8 +1999,7 @@ ${distanceLine}`;
     renderVoronoi(
         mapPoints,
         bestData,
-        (row) => getLcoeColor(row, colorInfo, colorScale),
-        { enableHoverSelect: false }
+        (row) => getLcoeColor(row, colorInfo, colorScale)
     );
 }
 
@@ -1503,19 +2032,6 @@ export function updateCfMap(cfData, options = {}) {
         // Use d.meetsTarget if present, otherwise default to true (legacy safe)
         const meetsTarget = d.meetsTarget !== false;
         const color = getLcoeColor({ ...d, lcoe: d.cf, meetsTarget }, colorInfo, colorScale);
-
-        // Visual marker
-        L.circleMarker([d.latitude, d.longitude], {
-            radius: 0.8,
-            fillColor: color,
-            color: color,
-            weight: 0,
-            opacity: 1,
-            fillOpacity: 0.9,
-            pane: 'markers',
-            interactive: false,
-            renderer: markerRenderer
-        }).addTo(markersLayer);
 
         // Hit marker
         const marker = L.circleMarker([d.latitude, d.longitude], {
@@ -1556,12 +2072,6 @@ export function updateCfMap(cfData, options = {}) {
         });
 
         marker.on('click', () => {
-            if (selectedMarker) {
-                selectedMarker.setStyle({ stroke: false, color: '#000', weight: 1, radius: 4 });
-            }
-            marker.setStyle({ color: '#fff', weight: 2, radius: 6 });
-            selectedMarker = marker;
-
             updateLocationPanel({ ...d, targetLcoe, meetsTarget }, color, 'lcoe');
 
             if (map.onLocationSelect) {
@@ -1569,12 +2079,7 @@ export function updateCfMap(cfData, options = {}) {
             }
         });
 
-        // Highlight reference if present
-        if (reference && reference.location_id === d.location_id) {
-            marker.setStyle({ color: '#f59e0b', weight: 3, radius: 6, opacity: 1 });
-            selectedMarker = marker;
-        }
-
+        d.__hitMarker = marker;
         marker.addTo(markersLayer);
     });
 
@@ -1599,63 +2104,110 @@ export function updateCfMap(cfData, options = {}) {
         (row) => {
             const meetsTarget = row.meetsTarget !== false;
             return getLcoeColor({ ...row, lcoe: row.cf, meetsTarget }, colorInfo, colorScale);
-        },
-        { enableHoverSelect: false }
+        }
     );
 }
 
 function renderVoronoi(mapPoints, data, fillAccessor, options = {}) {
-    const { enableHoverSelect = true } = options;
+    const { enableHoverSelect = true, useMarkerEvents = true, context = null } = options;
+    const perf = startMapPerf('render-voronoi', {
+        mode: currentMode,
+        points: mapPoints?.length || 0,
+        reuse: FEATURE_VORONOI_REUSE
+    });
     const hasClickHandler = typeof options.onClick === 'function';
     const allowPointerEvents = enableHoverSelect || hasClickHandler;
-    const svg = d3.select(voronoiLayer._container);
-    svg.selectAll("*").remove();
+    const mapRef = context?.map || map;
+    const voronoiLayerRef = context?.voronoiLayer || voronoiLayer;
+    const svg = d3.select(voronoiLayerRef._container);
+    if (!FEATURE_VORONOI_REUSE) {
+        svg.selectAll('*').remove();
+    }
+
+    if (mapRef === supplyMap) {
+        supplyVoronoiIndex = new Map();
+    }
 
     // If only one point, just a circle
     if (mapPoints.length === 1) {
         // ... (simplified for now, or just skip)
+        endMapPerf(perf, { rendered: 0, skipped: true });
         return;
     }
 
+    const clipId = mapRef?._leaflet_id ? `clip-land-${mapRef._leaflet_id}` : 'clip-land-main';
     if (worldGeoJSON) {
         const transform = d3.geoTransform({
             point: function (x, y) {
-                const point = map.latLngToLayerPoint(new L.LatLng(y, x));
+                const point = mapRef.latLngToLayerPoint(new L.LatLng(y, x));
                 this.stream.point(point.x, point.y);
             },
         });
         const path = d3.geoPath().projection(transform);
-
-        // Remove existing defs to avoid duplicates/stale clips
-        svg.select("defs").remove();
-
-        const defs = svg.append("defs");
-        defs
-            .append("clipPath")
-            .attr("id", "clip-land")
-            .append("path")
-            .datum(worldGeoJSON)
-            .attr("d", path);
+        const size = mapRef.getSize();
+        const center = mapRef.getCenter();
+        const clipVersion = `${size.x}x${size.y}|${mapRef.getZoom()}|${center.lat.toFixed(3)},${center.lng.toFixed(3)}`;
+        const versionKey = mapRef?._leaflet_id || 'main';
+        const shouldRefreshClip = !FEATURE_VORONOI_REUSE
+            || voronoiClipVersionByMap.get(versionKey) !== clipVersion
+            || svg.select(`#${clipId}`).empty();
+        if (shouldRefreshClip) {
+            let defs = svg.select('defs');
+            if (defs.empty()) {
+                defs = svg.append('defs');
+            }
+            let clipPath = defs.select(`#${clipId}`);
+            if (clipPath.empty()) {
+                clipPath = defs.append('clipPath').attr('id', clipId);
+                clipPath.append('path');
+            }
+            clipPath.select('path')
+                .datum(worldGeoJSON)
+                .attr('d', path);
+            voronoiClipVersionByMap.set(versionKey, clipVersion);
+        }
     }
 
-    const g = svg.append("g")
-        .attr("class", "voronoi-group")
-        .attr("clip-path", worldGeoJSON ? "url(#clip-land)" : null);
+    let g = FEATURE_VORONOI_REUSE ? svg.select('g.voronoi-group') : d3.select(null);
+    if (g.empty()) {
+        g = svg.append('g');
+    }
+    g.attr('class', 'voronoi-group')
+        .attr('clip-path', worldGeoJSON ? `url(#${clipId})` : null);
     g.style("pointer-events", allowPointerEvents ? "all" : "none");
 
     const delaunay = d3.Delaunay.from(mapPoints);
-    const size = map.getSize();
+    const size = mapRef.getSize();
     // Add buffer to cover the whole map view
     const buffer = Math.max(size.x, size.y);
     const bounds = [-buffer, -buffer, size.x + buffer, size.y + buffer];
     const voronoi = delaunay.voronoi(bounds);
+    const cellsData = data.map((row, i) => {
+        const key = Number.isFinite(row.location_id)
+            ? `id:${row.location_id}`
+            : `coord:${row.latitude.toFixed(4)},${row.longitude.toFixed(4)}`;
+        return {
+            key,
+            row,
+            path: voronoi.renderCell(i)
+        };
+    });
 
-    g.selectAll("path")
-        .data(data)
-        .enter()
-        .append("path")
-        .attr("d", (_, i) => voronoi.renderCell(i))
-        .each(function (d) {
+    let paths = g.selectAll('path.voronoi-cell');
+    paths = FEATURE_VORONOI_REUSE
+        ? paths.data(cellsData, d => d.key)
+        : paths.data(cellsData);
+    paths.exit().remove();
+
+    const enterPaths = paths.enter()
+        .append('path')
+        .attr('class', 'transition-color voronoi-cell leaflet-interactive');
+
+    enterPaths.merge(paths)
+        .attr('d', d => d.path)
+        .attr('data-loc-id', d => d.row.location_id)
+        .each(function (cell) {
+            const d = cell.row;
             const el = d3.select(this);
             const style = fillAccessor ? fillAccessor(d) : null;
             if (style && typeof style === 'object') {
@@ -1669,27 +2221,45 @@ function renderVoronoi(mapPoints, data, fillAccessor, options = {}) {
                     .attr("stroke", "rgba(255,255,255,0.08)")
                     .attr("stroke-width", 0.5);
             }
+            if (mapRef === supplyMap) {
+                const key = getRowKey(d);
+                if (key) supplyVoronoiIndex.set(key, this);
+            }
         })
-        .attr("class", "transition-color")
         .style("pointer-events", allowPointerEvents ? "all" : "none")
-        .on("click", (e, d) => {
+        .on("click", (e, cell) => {
+            const d = cell.row || cell;
+            if (useMarkerEvents) {
+                fireMarkerEvent(d, 'click');
+            }
             if (options.onClick) {
                 options.onClick(d);
             }
         })
-        .on("mouseover", (e, d) => {
+        .on("mouseover", function (e, cell) {
+            const d = cell.row || cell;
             if (!enableHoverSelect) return;
-            markersLayer.eachLayer(layer => {
-                if (!layer.getLatLng) return;
-                const latLng = layer.getLatLng();
-                if (Math.abs(latLng.lat - d.latitude) < 0.0001 && Math.abs(latLng.lng - d.longitude) < 0.0001) {
-                    layer.fire('click');
-                }
-            });
+            applyHoverRim(this);
+            if (useMarkerEvents) {
+                fireMarkerEvent(d, 'mouseover');
+            }
+            if (options.onHover) {
+                options.onHover(e, d);
+            }
         })
-        .on("mouseout", () => {
-            // Optional: clear selection if desired, or leave it
+        .on("mouseout", function (e, cell) {
+            const d = cell.row || cell;
+            if (!enableHoverSelect) return;
+            clearHoverRim(this);
+            if (useMarkerEvents) {
+                fireMarkerEvent(d, 'mouseout');
+            }
+            if (options.onOut) {
+                options.onOut(e, d);
+            }
         });
+
+    endMapPerf(perf, { rendered: cellsData.length });
 }
 
 // ========== SAMPLE DAYS FUNCTIONS ==========
@@ -1717,7 +2287,6 @@ export function updateMapWithSampleFrame(frameData) {
     const modeChanged = resetLayersForMode('samples', { preserveVoronoi: true });
     if (modeChanged) {
         lastSampleVoronoiKey = null;
-        sampleMarkersActive = false;
     }
 
     if (!samplePopup) {
@@ -1725,102 +2294,6 @@ export function updateMapWithSampleFrame(frameData) {
             closeButton: false,
             autoPan: false,
             className: 'bg-transparent border-none shadow-none'
-        });
-    }
-
-    if (!sampleMarkersActive && sampleMarkers.size) {
-        sampleMarkers.forEach(({ dot, hit }) => {
-            dot.addTo(markersLayer);
-            hit.addTo(markersLayer);
-        });
-        sampleMarkersActive = true;
-    }
-
-    // Add markers with dominance colors
-    const activeIds = new Set();
-    locations.forEach(loc => {
-        const color = loc.color;
-        const id = loc.location_id ?? coordKey(loc.latitude, loc.longitude);
-        activeIds.add(id);
-
-        let entry = sampleMarkers.get(id);
-        if (!entry) {
-            const dot = L.circleMarker([loc.latitude, loc.longitude], {
-                radius: 0.8,
-                fillColor: color,
-                color: color,
-                weight: 0,
-                opacity: 1,
-                fillOpacity: 0.9,
-                pane: 'markers',
-                interactive: false,
-                renderer: markerRenderer
-            });
-
-            const hit = L.circleMarker([loc.latitude, loc.longitude], {
-                radius: 6,
-                fillColor: '#fff',
-                color: '#fff',
-                weight: 0,
-                opacity: 0,
-                fillOpacity: 0,
-                pane: 'markers',
-                renderer: markerRenderer
-            });
-
-            hit.on('mouseover', () => {
-                const info = hit.__sampleInfo;
-                if (!info) return;
-                const solar = Number.isFinite(info.solarShare) ? (info.solarShare * 100).toFixed(1) : '--';
-                const battery = Number.isFinite(info.batteryShare) ? (info.batteryShare * 100).toFixed(1) : '--';
-                const other = Number.isFinite(info.otherShare) ? (info.otherShare * 100).toFixed(1) : '--';
-                const content = `<div class="bg-slate-900 text-white border border-slate-700 px-3 py-2 rounded text-xs max-w-xs">
-                    <div class="font-semibold">Generation mix</div>
-                    <div class="text-[11px] text-slate-300">Solar: ${solar}%</div>
-                    <div class="text-[11px] text-slate-300">Battery: ${battery}%</div>
-                    <div class="text-[11px] text-slate-300">Other: ${other}%</div>
-                </div>`;
-                samplePopup.setLatLng([info.latitude, info.longitude]).setContent(content).openOn(map);
-                hit.setStyle({ color: '#f59e0b', weight: 2, radius: 8, opacity: 1 });
-            });
-            hit.on('mouseout', () => {
-                map.closePopup(samplePopup);
-                hit.setStyle({ color: '#fff', weight: 0, radius: 6, opacity: 0 });
-            });
-            hit.on('click', () => {
-                if (sampleLocationHandler && hit.__sampleInfo) {
-                    sampleLocationHandler({ ...hit.__sampleInfo });
-                }
-            });
-
-            entry = { dot, hit };
-            sampleMarkers.set(id, entry);
-            if (activeLayerMode === 'samples') {
-                dot.addTo(markersLayer);
-                hit.addTo(markersLayer);
-            }
-        }
-
-        entry.dot.setStyle({ fillColor: color, color: color, opacity: 1, fillOpacity: 0.9 });
-        entry.hit.__sampleInfo = {
-            location_id: loc.location_id,
-            latitude: loc.latitude,
-            longitude: loc.longitude,
-            solarShare: loc.solarShare ?? 0,
-            batteryShare: loc.batteryShare ?? 0,
-            otherShare: loc.otherShare ?? 0
-        };
-    });
-
-    sampleMarkersActive = true;
-
-    if (sampleMarkers.size !== activeIds.size) {
-        sampleMarkers.forEach((entry, id) => {
-            if (!activeIds.has(id)) {
-                markersLayer.removeLayer(entry.dot);
-                markersLayer.removeLayer(entry.hit);
-                sampleMarkers.delete(id);
-            }
         });
     }
 
@@ -1888,8 +2361,41 @@ function renderSampleVoronoi(mapPoints, locations) {
         .attr("fill-opacity", 0.6)
         .attr("stroke", "rgba(255,255,255,0.08)")
         .attr("stroke-width", 0.5)
+        .attr("class", "transition-color voronoi-cell leaflet-interactive")
         .style("transition", "fill 0.9s ease")
-        .style("pointer-events", "none");
+        .style("pointer-events", "all")
+        .on("mouseover", function (e, d) {
+            applyHoverRim(this);
+            if (!samplePopup) return;
+            const solar = Number.isFinite(d.solarShare) ? (d.solarShare * 100).toFixed(1) : '--';
+            const battery = Number.isFinite(d.batteryShare) ? (d.batteryShare * 100).toFixed(1) : '--';
+            const other = Number.isFinite(d.otherShare) ? (d.otherShare * 100).toFixed(1) : '--';
+            const content = `<div class="bg-slate-900 text-white border border-slate-700 px-3 py-2 rounded text-xs max-w-xs">
+                <div class="font-semibold">Generation mix</div>
+                <div class="text-[11px] text-slate-300">Solar: ${solar}%</div>
+                <div class="text-[11px] text-slate-300">Battery: ${battery}%</div>
+                <div class="text-[11px] text-slate-300">Other: ${other}%</div>
+            </div>`;
+            samplePopup.setLatLng([d.latitude, d.longitude]).setContent(content).openOn(map);
+        })
+        .on("mouseout", function () {
+            clearHoverRim(this);
+            if (samplePopup) {
+                map.closePopup(samplePopup);
+            }
+        })
+        .on("click", function (e, d) {
+            if (sampleLocationHandler) {
+                sampleLocationHandler({
+                    location_id: d.location_id,
+                    latitude: d.latitude,
+                    longitude: d.longitude,
+                    solarShare: d.solarShare ?? 0,
+                    batteryShare: d.batteryShare ?? 0,
+                    otherShare: d.otherShare ?? 0
+                });
+            }
+        });
 }
 
 function updateSampleVoronoiColors(locations) {
@@ -1904,13 +2410,6 @@ function updateSampleVoronoiColors(locations) {
 
 export function setSampleLocationClickHandler(handler) {
     sampleLocationHandler = handler;
-    sampleMarkers.forEach(entry => {
-        const marker = entry.hit;
-        marker.off('click');
-        if (handler && marker.__sampleInfo) {
-            marker.on('click', () => handler({ ...marker.__sampleInfo }));
-        }
-    });
 }
 // ========== SUBSET MAP FUNCTIONS ==========
 
@@ -1979,90 +2478,75 @@ export function renderSubsetMap(allData, subsetIds, getValue, getColor, layerTyp
                 return;
             }
 
-            // Map points to pixel coords
+            // Render Voronoi (Clipped)
 
-            if (layerType === 'plants') {
-                // Render Points (Circles)
-                const subsetData = allData.filter(d => subsetSet.has(d.location_id));
+            // 1. Setup Clip Path
+            const transform = d3.geoTransform({
+                point: function (x, y) {
+                    const point = subsetMap.latLngToLayerPoint(new L.LatLng(y, x));
+                    this.stream.point(point.x, point.y);
+                },
+            });
+            const path = d3.geoPath().projection(transform);
 
-                const circles = svg.selectAll("circle")
-                    .data(subsetData)
-                    .enter()
-                    .append("circle")
-                    .attr("cx", d => subsetMap.latLngToLayerPoint([d.latitude, d.longitude]).x)
-                    .attr("cy", d => subsetMap.latLngToLayerPoint([d.latitude, d.longitude]).y)
-                    .attr("r", d => getRadius ? getRadius(d) : 4)
-                    .attr("fill", d => getColor(getValue(d)))
-                    .attr("fill-opacity", 0.3)
-                    .attr("stroke", "none")
-                    .attr("stroke-width", 0)
-                    .style("pointer-events", "auto");
-
-                if (onPointHover || onPointOut) {
-                    circles
-                        .on("mouseover", (e, d) => onPointHover && onPointHover(e, d))
-                        .on("mouseout", (e, d) => onPointOut && onPointOut(e, d));
-                } else {
-                    circles.append("title")
-                        .text(d => getTooltip ? getTooltip(d) : `Value: ${formatNumber(getValue(d), 2)}`);
-                }
-
-            } else {
-                // Render Voronoi (Clipped)
-
-                // 1. Setup Clip Path
-                const transform = d3.geoTransform({
-                    point: function (x, y) {
-                        const point = subsetMap.latLngToLayerPoint(new L.LatLng(y, x));
-                        this.stream.point(point.x, point.y);
-                    },
-                });
-                const path = d3.geoPath().projection(transform);
-
-                if (worldGeoJSON) {
-                    const defs = svg.append("defs");
-                    defs.append("clipPath")
-                        .attr("id", "clip-land-subset")
-                        .append("path")
-                        .datum(worldGeoJSON)
-                        .attr("d", path);
-                }
-
-                const buffer = Math.max(size.x, size.y);
-                const bounds = [-buffer, -buffer, size.x + buffer, size.y + buffer];
-
-                const points = allData.map(d => {
-                    const p = subsetMap.latLngToLayerPoint([d.latitude, d.longitude]);
-                    return [p.x, p.y];
-                });
-
-                const delaunay = d3.Delaunay.from(points);
-                const voronoi = delaunay.voronoi(bounds);
-
-                // Pre-filter data indices for the subset
-                const pathsData = [];
-                allData.forEach((d, i) => {
-                    if (subsetSet.has(d.location_id)) {
-                        pathsData.push({ d, i });
-                    }
-                });
-
-                // 2. Render paths with clip-path
-                svg.append("g")
-                    .attr("clip-path", worldGeoJSON ? "url(#clip-land-subset)" : null)
-                    .selectAll("path")
-                    .data(pathsData)
-                    .enter()
+            if (worldGeoJSON) {
+                const defs = svg.append("defs");
+                defs.append("clipPath")
+                    .attr("id", "clip-land-subset")
                     .append("path")
-                    .attr("d", p => voronoi.renderCell(p.i))
-                    .attr("fill", p => getColor(getValue(p.d)))
-                    .attr("fill-opacity", 0.9)
-                    .attr("stroke", "none")
-                    .style("pointer-events", "auto")
-                    .append("title")
+                    .datum(worldGeoJSON)
+                    .attr("d", path);
+            }
+
+            const buffer = Math.max(size.x, size.y);
+            const bounds = [-buffer, -buffer, size.x + buffer, size.y + buffer];
+
+            const points = allData.map(d => {
+                const p = subsetMap.latLngToLayerPoint([d.latitude, d.longitude]);
+                return [p.x, p.y];
+            });
+
+            const delaunay = d3.Delaunay.from(points);
+            const voronoi = delaunay.voronoi(bounds);
+
+            // Pre-filter data indices for the subset
+            const pathsData = [];
+            allData.forEach((d, i) => {
+                if (subsetSet.has(d.location_id)) {
+                    pathsData.push({ d, i });
+                }
+            });
+
+            // 2. Render paths with clip-path
+            const paths = svg.append("g")
+                .attr("clip-path", worldGeoJSON ? "url(#clip-land-subset)" : null)
+                .selectAll("path")
+                .data(pathsData)
+                .enter()
+                .append("path")
+                .attr("d", p => voronoi.renderCell(p.i))
+                .attr("fill", p => getColor(getValue(p.d)))
+                .attr("fill-opacity", 0.9)
+                .attr("stroke", "rgba(255,255,255,0.08)")
+                .attr("stroke-width", 0.5)
+                .attr("class", "transition-color voronoi-cell leaflet-interactive")
+                .style("pointer-events", "all");
+
+            if (onPointHover || onPointOut) {
+                paths
+                    .on("mouseover", function (e, p) {
+                        applyHoverRim(this);
+                        if (onPointHover) onPointHover(e, p.d);
+                    })
+                    .on("mouseout", function (e, p) {
+                        clearHoverRim(this);
+                        if (onPointOut) onPointOut(e, p.d);
+                    });
+            } else {
+                paths.append("title")
                     .text(p => {
                         const val = getValue(p.d);
-                        return `Value: ${formatNumber(val, 2)}`;
+                        return getTooltip ? getTooltip(p.d) : `Value: ${formatNumber(val, 2)}`;
                     });
             }
         } catch (e) {

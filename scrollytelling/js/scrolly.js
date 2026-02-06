@@ -4,15 +4,17 @@
  */
 
 import { getVisualState, hasAnimation, getAnimation, interpolate } from './visual-states.js';
-import { loadSummary, loadPopulationCsv, loadGemPlantsCsv, loadVoronoiGemCapacityCsv, loadElectricityDemandData, loadReliabilityCsv, loadSample, loadSampleColumnar, loadPvoutPotentialCsv, loadVoronoiWaccCsv, loadVoronoiLocalCapexCsv } from './data.js';
+import { loadSummary, loadPopulationCsv, loadGemPlantsCsv, loadVoronoiGemCapacityCsv, loadElectricityDemandData, loadReliabilityCsv, loadSample, loadSampleColumnar, loadWeeklyFrameCache, loadPvoutPotentialCsv, loadVoronoiWaccCsv, loadVoronoiLocalCapexCsv } from './data.js';
 import { initMap, updateMap, updatePopulationSimple, updateLcoeMap, updateLcoePlantOverlay, updatePotentialMap, setAccessMetric, updateMapWithSampleFrame, clearAllMapLayers, map, initSampleFrameMap, updateSampleFrameColors, isSampleFrameInitialized, resetSampleFrameState, renderDualGlobes, hideDualGlobes } from './map.js';
 import { capitalRecoveryFactor as crf } from './utils.js';
 import { transitionController, initTransitions, TRANSITION_DURATION, interpolateColor } from './transitions.js';
-import { showPopulationCfChart, showReliabilityChart, showFossilDisplacementChart, showWeeklySampleChart, showUptimeComparisonChart, showCumulativeCapacityChart, showNoAccessLcoeChart, showGlobalPopulationLcoeChart, hideChart } from './scrolly-charts.js';
-import { POTENTIAL_MULTIPLE_BUCKETS } from './constants.js';
+import { showPopulationCfChart, showFossilDisplacementChart, showWeeklySampleChart, showUptimeComparisonChart, showCumulativeCapacityChart, showNoAccessLcoeChart, showGlobalPopulationLcoeChart, hideChart } from './scrolly-charts.js';
+import { POTENTIAL_MULTIPLE_BUCKETS, FEATURE_WORKER_LCOE, FEATURE_STAGED_PRELOAD, FEATURE_FRAMECACHE } from './constants.js';
 
 // ========== STATE ==========
 let summaryData = [];
+let summaryByConfig = new Map();
+let summaryStatsByConfig = new Map();
 let populationData = [];
 let fossilPlants = [];
 let fossilCapacityData = [];
@@ -54,22 +56,67 @@ let currentWeekFrame = 0;
 let isAnimatingWeekly = false;
 let currentSolarState = 6; // Default solar capacity
 let preloadPromise = null;
+let stagedPreloadController = null;
+let stagedPreloadSerial = 0;
 let weeklySampleKey = null;
 let weeklySampleLoading = null;
 let weeklySampleRequestId = 0;
 let lastLcoeResults = null;
 let lastLcoeColorInfo = null;
+let lcoeWorker = null;
+let lcoeWorkerReady = false;
+let lcoeWorkerRequestSeq = 0;
+let lcoeWorkerReadyPromise = null;
+const lcoeWorkerPending = new Map();
+const lcoeWorkerCache = new Map();
+const lcoeWorkerInFlight = new Set();
 let scrollSections = [];
 let scrollSectionIndex = new Map();
 let scrollOpacityRaf = null;
 let lastOverlayOpacity = null;
 let lastScrollMetrics = null;
 let pendingSectionId = null;
+let pendingSectionVersion = 0;
 let currentPotentialLevel = null;
 let currentPotentialDisplayMode = 'multiple';
+let sectionRenderVersion = 0;
 
 const GAP_FADE_FRACTION = 0.2;
 const MIN_BLACK_HOLD_PX = 48;
+const PRELOAD_IDLE_TIMEOUT_MS = 1200;
+
+function isSectionRenderCurrent(sectionId, renderVersion) {
+    return currentSection === sectionId && renderVersion === sectionRenderVersion;
+}
+
+function getHeapMb() {
+    const used = performance?.memory?.usedJSHeapSize;
+    return Number.isFinite(used) ? (used / 1048576) : null;
+}
+
+function startPerf(label, meta = {}) {
+    return {
+        label,
+        meta,
+        startMs: performance.now(),
+        startHeapMb: getHeapMb()
+    };
+}
+
+function endPerf(marker, extra = {}) {
+    if (!marker) return;
+    const endHeapMb = getHeapMb();
+    const durationMs = performance.now() - marker.startMs;
+    const heapDeltaMb = (Number.isFinite(endHeapMb) && Number.isFinite(marker.startHeapMb))
+        ? (endHeapMb - marker.startHeapMb)
+        : null;
+    console.debug(`[perf] ${marker.label}`, {
+        durationMs: Number(durationMs.toFixed(2)),
+        heapDeltaMb: Number.isFinite(heapDeltaMb) ? Number(heapDeltaMb.toFixed(3)) : null,
+        ...marker.meta,
+        ...extra
+    });
+}
 
 // LCOE default parameters
 const lcoeParams = {
@@ -106,6 +153,64 @@ const WEEKLY_SEASONS = [
     { id: 'fall', label: 'Fall' },
     { id: 'winter', label: 'Winter' }
 ];
+
+function getConfigKey(solarGw, battGwh) {
+    return `s${solarGw}_b${battGwh}`;
+}
+
+function prepareSummaryIndexes(data) {
+    summaryByConfig = new Map();
+    summaryStatsByConfig = new Map();
+    locationIndex = new Map();
+
+    const stats = new Map();
+
+    data.forEach((row) => {
+        const configKey = getConfigKey(row.solar_gw, row.batt_gwh);
+        row._configKey = configKey;
+
+        const configRows = summaryByConfig.get(configKey);
+        if (configRows) {
+            configRows.push(row);
+        } else {
+            summaryByConfig.set(configKey, [row]);
+        }
+
+        let locationRows = locationIndex.get(row.location_id);
+        if (!locationRows) {
+            locationRows = [];
+            locationIndex.set(row.location_id, locationRows);
+        }
+        locationRows.push(row);
+
+        let stat = stats.get(configKey);
+        if (!stat) {
+            stat = { sum: 0, max: -Infinity, count: 0 };
+            stats.set(configKey, stat);
+        }
+        if (Number.isFinite(row.annual_cf)) {
+            stat.sum += row.annual_cf;
+            stat.max = Math.max(stat.max, row.annual_cf);
+            stat.count += 1;
+        }
+    });
+
+    stats.forEach((stat, key) => {
+        summaryStatsByConfig.set(key, {
+            count: stat.count,
+            avg: stat.count ? stat.sum / stat.count : null,
+            max: stat.count ? stat.max : null
+        });
+    });
+}
+
+function getSummaryForConfig(solarGw, battGwh) {
+    return summaryByConfig.get(getConfigKey(solarGw, battGwh)) || [];
+}
+
+function getSummaryStatsForConfig(solarGw, battGwh) {
+    return summaryStatsByConfig.get(getConfigKey(solarGw, battGwh)) || null;
+}
 
 // ========== DOM ELEMENTS ==========
 const loadingOverlay = document.getElementById('loading');
@@ -172,16 +277,14 @@ async function init() {
 
     try {
         // Load primary data
+        const summaryLoadPerf = startPerf('scrolly-summary-load');
         summaryData = await loadSummary();
+        endPerf(summaryLoadPerf, { rows: summaryData?.length || 0 });
         console.log(`Loaded ${summaryData.length} summary rows`);
-
-        // Build location index
-        summaryData.forEach(row => {
-            if (!locationIndex.has(row.location_id)) {
-                locationIndex.set(row.location_id, []);
-            }
-            locationIndex.get(row.location_id).push(row);
-        });
+        prepareSummaryIndexes(summaryData);
+        if (FEATURE_WORKER_LCOE) {
+            ensureScrollyLcoeWorkerReady();
+        }
 
         updateLoadingStatus('Initializing map...');
         await initMap(onLocationSelect);
@@ -215,11 +318,13 @@ async function init() {
         loadingOverlay.classList.add('hidden');
 
         // Initial render with hero state
-        applyVisualState('hero');
+        currentSection = 'hero';
+        sectionRenderVersion += 1;
+        applyVisualState('hero', sectionRenderVersion);
         updateScrollOpacity();
 
         // Preload scrollytelling datasets in the background for smoother scrolling
-        preloadScrollyData();
+        preloadScrollyData({ sectionId: 'hero', immediate: ['potential'] });
 
         // Ensure map is correctly sized and centered after layout settles
         setTimeout(() => {
@@ -235,19 +340,147 @@ async function init() {
     }
 }
 
-async function preloadScrollyData() {
-    if (preloadPromise) return preloadPromise;
+function getPreloadTaskRunner(taskId) {
+    switch (taskId) {
+        case 'population': return ensurePopulationData;
+        case 'reliability': return ensureReliabilityData;
+        case 'fossil': return ensureFossilData;
+        case 'potential': return ensurePotentialData;
+        case 'electricity': return ensureElectricityData;
+        case 'weekly': return preloadWeeklyConfigs;
+        case 'wacc': return ensureWaccData;
+        case 'capex': return ensureLocalCapexData;
+        default: return null;
+    }
+}
 
-    preloadPromise = Promise.allSettled([
-        ensurePopulationData(),
-        ensureReliabilityData(),
-        ensureFossilData(),
-        ensurePotentialData(),
-        ensureElectricityData(),
-        preloadWeeklyConfigs()
-    ]).catch((err) => {
-        console.warn('Preload failed:', err);
+function buildPreloadTaskList(sectionId, immediate = []) {
+    const sectionKey = sectionId || currentSection || 'hero';
+    const planBySection = {
+        hero: ['potential', 'weekly', 'population'],
+        'potential-map': ['electricity', 'weekly', 'population'],
+        'battery-shadow': ['weekly', 'population'],
+        'battery-capacity': ['weekly', 'population', 'reliability'],
+        widespread: ['population', 'reliability'],
+        'cheap-populous': ['population', 'electricity', 'wacc'],
+        'cheap-access': ['reliability', 'population'],
+        'better-uptime': ['reliability', 'population'],
+        'planned-capacity': ['fossil', 'population'],
+        'lcoe-outlook': ['wacc', 'capex', 'population'],
+        'path-forward': ['population']
+    };
+
+    const ordered = [];
+    const seen = new Set();
+    const pushTask = (id, priority) => {
+        const runner = getPreloadTaskRunner(id);
+        if (!runner || seen.has(id)) return;
+        seen.add(id);
+        ordered.push({ id, priority, run: runner });
+    };
+
+    immediate.forEach((taskId) => pushTask(taskId, 'immediate'));
+    (planBySection[sectionKey] || []).forEach((taskId) => pushTask(taskId, 'idle'));
+
+    // Always keep low-priority warmup for downstream sections.
+    ['population', 'reliability', 'fossil', 'electricity', 'weekly', 'wacc', 'capex']
+        .forEach((taskId) => pushTask(taskId, 'idle'));
+
+    return ordered;
+}
+
+function getImmediateTasksForSection(sectionId) {
+    switch (sectionId) {
+        case 'potential-map': return ['potential'];
+        case 'battery-shadow': return ['weekly'];
+        case 'cheap-populous': return ['population'];
+        case 'cheap-access': return ['reliability', 'population'];
+        case 'planned-capacity': return ['fossil'];
+        case 'lcoe-outlook': return ['wacc', 'capex'];
+        default: return [];
+    }
+}
+
+function waitForIdleWindow(signal, timeout = PRELOAD_IDLE_TIMEOUT_MS) {
+    if (signal?.aborted) return Promise.resolve();
+
+    return new Promise((resolve) => {
+        const done = () => resolve();
+        if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
+            const handle = window.requestIdleCallback(() => done(), { timeout });
+            if (signal) {
+                signal.addEventListener('abort', () => {
+                    window.cancelIdleCallback(handle);
+                    done();
+                }, { once: true });
+            }
+            return;
+        }
+
+        const timer = setTimeout(done, 32);
+        if (signal) {
+            signal.addEventListener('abort', () => {
+                clearTimeout(timer);
+                done();
+            }, { once: true });
+        }
     });
+}
+
+async function runStagedPreload(taskList, signal) {
+    for (const task of taskList) {
+        if (signal?.aborted) return;
+        try {
+            if (task.priority !== 'immediate') {
+                await waitForIdleWindow(signal);
+            }
+            if (signal?.aborted) return;
+            await task.run();
+        } catch (err) {
+            console.warn(`Preload task failed (${task.id}):`, err);
+        }
+    }
+}
+
+async function preloadScrollyData({ sectionId = null, immediate = [] } = {}) {
+    if (!FEATURE_STAGED_PRELOAD) {
+        if (preloadPromise) return preloadPromise;
+        preloadPromise = Promise.allSettled([
+            ensurePopulationData(),
+            ensureReliabilityData(),
+            ensureFossilData(),
+            ensurePotentialData(),
+            ensureElectricityData(),
+            preloadWeeklyConfigs()
+        ]).catch((err) => {
+            console.warn('Preload failed:', err);
+        });
+        return preloadPromise;
+    }
+
+    stagedPreloadSerial += 1;
+    const runSerial = stagedPreloadSerial;
+    if (stagedPreloadController) {
+        stagedPreloadController.abort();
+    }
+    stagedPreloadController = new AbortController();
+    const taskList = buildPreloadTaskList(sectionId, immediate);
+    const preloadPerf = startPerf('scrolly-preload', {
+        sectionId: sectionId || currentSection || 'hero',
+        tasks: taskList.map(task => `${task.priority}:${task.id}`)
+    });
+
+    preloadPromise = runStagedPreload(taskList, stagedPreloadController.signal)
+        .catch((err) => {
+            if (stagedPreloadController?.signal?.aborted) return;
+            console.warn('Staged preload failed:', err);
+        })
+        .finally(() => {
+            endPerf(preloadPerf, { aborted: stagedPreloadController?.signal?.aborted === true });
+            if (runSerial === stagedPreloadSerial) {
+                preloadPromise = null;
+            }
+        });
 
     return preloadPromise;
 }
@@ -717,9 +950,10 @@ function updateLcoeOutlookMap() {
 
 async function onLocationSelect(data, mode) {
     console.log('Location selected:', data, mode);
+    const sectionAtStart = currentSection;
 
     // Section 3: Batteries Make the Sun Shine After Dark
-    if (currentSection === 'battery-shadow' && weeklySampleData) {
+    if (sectionAtStart === 'battery-shadow' && weeklySampleData) {
         // Find the sample data for this location
         // data.location_id comes from the click event
         const locationId = Number(data.location_id);
@@ -754,6 +988,9 @@ async function onLocationSelect(data, mode) {
 
             console.log(`Updating weekly chart for ${locationName}`);
             await showWeeklySampleChart(chartData, locationName);
+            if (currentSection !== sectionAtStart) {
+                hideChart();
+            }
             // Re-show legend if it was hidden by chart? No, scrolly-visual keeps it.
         }
     }
@@ -800,11 +1037,14 @@ function setupScrollObserver() {
 
 function onSectionEnter(sectionId) {
     console.log('Entering section:', sectionId);
+    const sectionPerf = startPerf('scrolly-section-enter', { sectionId });
 
     // STOP ALL ANIMATIONS IMMEDIATELY
     stopAnimations();
 
     currentSection = sectionId;
+    sectionRenderVersion += 1;
+    const renderVersion = sectionRenderVersion;
 
     // Clear any data-link override when scrolling to a new section
     if (dataLinkOverride) {
@@ -819,7 +1059,13 @@ function onSectionEnter(sectionId) {
 
     updateSectionDots(sectionId);
 
-    applyVisualState(sectionId);
+    preloadScrollyData({
+        sectionId,
+        immediate: FEATURE_STAGED_PRELOAD ? getImmediateTasksForSection(sectionId) : []
+    });
+
+    applyVisualState(sectionId, renderVersion);
+    endPerf(sectionPerf);
 }
 
 function setupInteractions() {
@@ -901,7 +1147,11 @@ function setupInteractions() {
             if (currentSection === 'battery-capacity') {
                 const batteryVal = animationValue ? parseInt(animationValue.textContent, 10) : 0;
                 if (Number.isFinite(batteryVal) && summaryData.length > 0) {
-                    updateMap(summaryData, currentSolarState, batteryVal, getVisualState('battery-capacity')?.mapOptions || {});
+                    const cfData = getSummaryForConfig(currentSolarState, batteryVal);
+                    updateMap(cfData, currentSolarState, batteryVal, {
+                        ...(getVisualState('battery-capacity')?.mapOptions || {}),
+                        preFiltered: true
+                    });
                 }
             }
         });
@@ -1060,11 +1310,11 @@ async function handleDataLinkClick(link) {
 
     // Handle different chart types
     if (chartType === 'population-cf') {
-        const cfData = summaryData.filter(d => d.solar_gw === 5 && d.batt_gwh === 8);
+        const cfData = getSummaryForConfig(5, 8);
         await showPopulationCfChart(populationData, cfData);
         updateVisualLabel({ title: 'Population Distribution', subtitle: 'By Capacity Factor Percentile' });
     } else if (chartType === 'fossil-displacement') {
-        const cfData = summaryData.filter(d => d.solar_gw === 6 && d.batt_gwh === 20);
+        const cfData = getSummaryForConfig(6, 20);
         await showFossilDisplacementChart(fossilCapacityData, cfData, ['coal']);
         updateVisualLabel({ title: 'Coal Displacement Potential', subtitle: 'Capacity by CF Viability' });
     } else if (view === 'lcoe') {
@@ -1176,7 +1426,8 @@ async function applyPotentialLevel(level, { updateLabel = true, updateMap = true
     });
 }
 
-async function applyVisualState(sectionId) {
+async function applyVisualState(sectionId, renderVersion = sectionRenderVersion) {
+    if (!isSectionRenderCurrent(sectionId, renderVersion)) return;
     const state = getVisualState(sectionId);
     if (!state) return;
 
@@ -1210,21 +1461,29 @@ async function applyVisualState(sectionId) {
     // Ensure necessary data is loaded before rendering map
     if (sectionId === 'cheap-populous') {
         await ensurePopulationData();
+        if (!isSectionRenderCurrent(sectionId, renderVersion)) return;
     } else if (sectionId === 'cheap-access' || sectionId === 'better-uptime') {
         await ensureReliabilityData();
+        if (!isSectionRenderCurrent(sectionId, renderVersion)) return;
     } else if (sectionId === 'planned-capacity') {
         await ensureFossilData();
+        if (!isSectionRenderCurrent(sectionId, renderVersion)) return;
     } else if (sectionId === 'potential-map') {
         await ensurePotentialData();
+        if (!isSectionRenderCurrent(sectionId, renderVersion)) return;
         await ensureElectricityData();
+        if (!isSectionRenderCurrent(sectionId, renderVersion)) return;
         ensurePotentialLatBounds(state.level || 'level1');
     }
 
     if (shouldDelaySection(sectionId)) {
         pendingSectionId = sectionId;
+        pendingSectionVersion = renderVersion;
         return;
     }
     pendingSectionId = null;
+    pendingSectionVersion = 0;
+    if (!isSectionRenderCurrent(sectionId, renderVersion)) return;
 
     // Update label
     updateVisualLabel(state.label);
@@ -1236,6 +1495,7 @@ async function applyVisualState(sectionId) {
         if (sectionId === 'potential-map') {
             currentPotentialDisplayMode = state.displayMode || 'multiple';
             await applyPotentialLevel(state.level || 'level1', { updateLabel: false, updateMap: false });
+            if (!isSectionRenderCurrent(sectionId, renderVersion)) return;
             potentialToggle.classList.remove('hidden');
         } else {
             potentialToggle.classList.add('hidden');
@@ -1243,23 +1503,27 @@ async function applyVisualState(sectionId) {
     }
 
     // Handle chart visibility based on section
-    await handleSectionCharts(sectionId, state);
+    await handleSectionCharts(sectionId, state, renderVersion);
+    if (!isSectionRenderCurrent(sectionId, renderVersion)) return;
 
     // Reset map view for each section so user panning doesn't carry over
     resetMapViewForSection(state);
 
     // Check for animation
     if (hasAnimation(sectionId) && !isAnimating) {
-        runAnimation(sectionId, state);
+        runAnimation(sectionId, state, renderVersion);
     } else if (!isAnimating) {
         // Apply crossfade transition
         transitionController.crossfade(() => {
-            renderVisualState(state);
+            if (!isSectionRenderCurrent(sectionId, renderVersion)) return;
+            renderVisualState(state, sectionId, renderVersion);
         });
     }
 }
 
-async function handleSectionCharts(sectionId, state) {
+async function handleSectionCharts(sectionId, state, renderVersion = sectionRenderVersion) {
+    if (!isSectionRenderCurrent(sectionId, renderVersion)) return;
+    const isStale = () => !isSectionRenderCurrent(sectionId, renderVersion);
     // Hide chart by default
     let showChart = false;
 
@@ -1311,9 +1575,10 @@ async function handleSectionCharts(sectionId, state) {
 
         if (!weeklySampleData) {
             await updateWeeklyData(currentWeeklyConfigId, currentWeeklySeason);
+            if (isStale()) return;
         }
 
-        if (currentSection !== sectionId) return;
+        if (isStale()) return;
 
         if (weeklySampleData && weeklySampleData.length > 0) {
             // Start map animation
@@ -1332,6 +1597,7 @@ async function handleSectionCharts(sectionId, state) {
     else if (sectionId === 'cheap-populous') {
         hideDualGlobes();
         await ensurePopulationData();
+        if (isStale()) return;
         const state = getVisualState('cheap-populous');
         if (inlineTargetCfContainer) inlineTargetCfContainer.classList.remove('hidden');
 
@@ -1345,29 +1611,48 @@ async function handleSectionCharts(sectionId, state) {
         const lcoeResults = computeLcoeForAllLocations(targetCf);
         showChart = true;
         await showGlobalPopulationLcoeChart(populationData, lcoeResults);
-        if (currentSection !== sectionId) hideChart();
+        if (isStale()) {
+            hideChart();
+            return;
+        }
     }
     // Section 5: Cheap Where Access is Lacking
     else if (sectionId === 'cheap-access') {
         await ensureReliabilityData();
+        if (isStale()) return;
         if (reliabilityData.length > 0) {
             showChart = true;
-            await showReliabilityChart(reliabilityData);
-            if (currentSection !== sectionId) hideChart();
+            const targetCfValue = targetCfSlider
+                ? parseInt(targetCfSlider.value, 10)
+                : (state.targetCf || DEFAULT_LCOE_TARGET_CF);
+            const normalizedTargetCf = Number.isFinite(targetCfValue)
+                ? targetCfValue
+                : (state.targetCf || DEFAULT_LCOE_TARGET_CF);
+            const lcoeResults = computeLcoeForAllLocations(normalizedTargetCf / 100);
+            await showNoAccessLcoeChart(reliabilityData, locationIndex, lcoeParams, normalizedTargetCf, lcoeResults);
+            if (isStale()) {
+                hideChart();
+                return;
+            }
         }
     }
     // Section 6: Better Uptime
     else if (sectionId === 'better-uptime') {
         await ensureReliabilityData();
+        if (isStale()) return;
         if (reliabilityData.length > 0) {
             showChart = true;
             await showUptimeComparisonChart(reliabilityData, locationIndex, lcoeParams);
-            if (currentSection !== sectionId) hideChart();
+            if (isStale()) {
+                hideChart();
+                return;
+            }
         }
     }
     // Section 7: Planned Capacity
     else if (sectionId === 'planned-capacity') {
         await ensureFossilData();
+        if (isStale()) return;
 
         if (targetCfContainer) targetCfContainer.classList.remove('hidden');
         if (inlineTargetCfContainer) inlineTargetCfContainer.classList.remove('hidden');
@@ -1399,7 +1684,10 @@ async function handleSectionCharts(sectionId, state) {
 
             // Render Chart
             await showCumulativeCapacityChart(fossilCapacityData, lcoeResults);
-            if (currentSection !== sectionId) hideChart();
+            if (isStale()) {
+                hideChart();
+                return;
+            }
         }
     }
     // Section 9: LCOE Outlook
@@ -1411,6 +1699,7 @@ async function handleSectionCharts(sectionId, state) {
         startOutlookAnimation();
     }
 
+    if (isStale()) return;
     if (!showChart) {
         hideChart();
     }
@@ -1465,13 +1754,15 @@ function updateLegend(legendType) {
     }
 }
 
-function renderVisualState(state) {
+function renderVisualState(state, sectionId = currentSection, renderVersion = sectionRenderVersion) {
+    if (!isSectionRenderCurrent(sectionId, renderVersion)) return;
     const { viewMode } = state;
 
     if (viewMode === 'capacity') {
         const solar = state.solar || 5;
         const battery = state.battery || 8;
-        updateMap(summaryData, solar, battery, state.mapOptions || {});
+        const cfData = getSummaryForConfig(solar, battery);
+        updateMap(cfData, solar, battery, { ...(state.mapOptions || {}), preFiltered: true });
 
     } else if (viewMode === 'potential') {
         const level = state.level || 'level1';
@@ -1498,7 +1789,7 @@ function renderVisualState(state) {
 
         let cfData = [];
         if (overlayMode === 'cf' && solar && battery) {
-            cfData = summaryData.filter(d => d.solar_gw === solar && d.batt_gwh === battery);
+            cfData = getSummaryForConfig(solar, battery);
         }
 
         if (baseLayer === 'access') {
@@ -1543,15 +1834,13 @@ function renderVisualState(state) {
             accessMetric: metric
         });
 
-        showNoAccessLcoeChart(reliabilityData, locationIndex, lcoeParams, targetCf, lcoeResults);
-
         if (targetCfContainer) targetCfContainer.classList.remove('hidden');
         if (inlineTargetCfContainer) inlineTargetCfContainer.classList.remove('hidden');
 
     } else if (viewMode === 'uptime-comparison') {
         const solar = state.solar || 6;
         const battery = state.battery || 20;
-        const cfData = summaryData.filter(d => d.solar_gw === solar && d.batt_gwh === battery);
+        const cfData = getSummaryForConfig(solar, battery);
 
         updatePopulationSimple(populationData, {
             baseLayer: 'uptime',
@@ -1589,7 +1878,8 @@ function stopAnimations() {
     }
 }
 
-function runAnimation(sectionId, state) {
+function runAnimation(sectionId, state, renderVersion = sectionRenderVersion) {
+    if (!isSectionRenderCurrent(sectionId, renderVersion)) return;
     // Ensure clean slate
     stopAnimations();
 
@@ -1606,20 +1896,20 @@ function runAnimation(sectionId, state) {
 
     if (type === 'battery-loop' && loop) {
         // Looping animation through discrete steps
-        runLoopingAnimation(sectionId, state, steps || [0, 8, 16, 24], duration);
+        runLoopingAnimation(sectionId, state, steps || [0, 8, 16, 24], duration, renderVersion);
     } else if (type === 'battery-slider') {
         // One-shot animation from->to
-        runOneShotAnimation(sectionId, state, from, to, duration, easing);
+        runOneShotAnimation(sectionId, state, from, to, duration, easing, renderVersion);
     }
 }
 
-function runLoopingAnimation(sectionId, state, steps, totalDuration) {
+function runLoopingAnimation(sectionId, state, steps, totalDuration, renderVersion = sectionRenderVersion) {
     let stepIndex = 0;
     const stepDuration = totalDuration / steps.length;
 
     function animateStep() {
         // Check if user has scrolled away
-        if (currentSection !== sectionId) {
+        if (!isSectionRenderCurrent(sectionId, renderVersion)) {
             isAnimating = false;
             if (animationIndicator) {
                 animationIndicator.classList.add('hidden');
@@ -1641,7 +1931,8 @@ function runLoopingAnimation(sectionId, state, steps, totalDuration) {
         }
 
         // Update map with current battery value AND current solar value from slider
-        updateMap(summaryData, currentSolarState, currentValue, state.mapOptions || {});
+        const cfData = getSummaryForConfig(currentSolarState, currentValue);
+        updateMap(cfData, currentSolarState, currentValue, { ...(state.mapOptions || {}), preFiltered: true });
 
         // Move to next step (loop back to 0)
         stepIndex = (stepIndex + 1) % steps.length;
@@ -1653,10 +1944,17 @@ function runLoopingAnimation(sectionId, state, steps, totalDuration) {
     animateStep();
 }
 
-function runOneShotAnimation(sectionId, state, from, to, duration, easing) {
+function runOneShotAnimation(sectionId, state, from, to, duration, easing, renderVersion = sectionRenderVersion) {
     const startTime = performance.now();
 
     function animate(currentTime) {
+        if (!isSectionRenderCurrent(sectionId, renderVersion)) {
+            isAnimating = false;
+            if (animationIndicator) {
+                animationIndicator.classList.add('hidden');
+            }
+            return;
+        }
         const elapsed = currentTime - startTime;
         const progress = Math.min(elapsed / duration, 1);
 
@@ -1673,7 +1971,9 @@ function runOneShotAnimation(sectionId, state, from, to, duration, easing) {
             visualLabelSubtitle.textContent = `Battery: ${currentValue} MWh`;
         }
 
-        updateMap(summaryData, state.solar || 5, currentValue, state.mapOptions || {});
+        const solar = state.solar || 5;
+        const cfData = getSummaryForConfig(solar, currentValue);
+        updateMap(cfData, solar, currentValue, { ...(state.mapOptions || {}), preFiltered: true });
 
         if (progress < 1) {
             animationFrame = requestAnimationFrame(animate);
@@ -1682,7 +1982,7 @@ function runOneShotAnimation(sectionId, state, from, to, duration, easing) {
             if (animationIndicator) {
                 animationIndicator.classList.add('hidden');
             }
-            renderVisualState(state);
+            renderVisualState(state, sectionId, renderVersion);
         }
     }
 
@@ -1852,8 +2152,11 @@ function maybeApplyPendingSection(metrics = null) {
     if (!pendingSectionId) return;
     if (shouldDelaySection(pendingSectionId, metrics)) return;
     const sectionId = pendingSectionId;
+    const renderVersion = pendingSectionVersion || sectionRenderVersion;
     pendingSectionId = null;
-    applyVisualState(sectionId);
+    pendingSectionVersion = 0;
+    if (!isSectionRenderCurrent(sectionId, renderVersion)) return;
+    applyVisualState(sectionId, renderVersion);
 }
 
 function updateScrollOpacity() {
@@ -1874,7 +2177,162 @@ function updateScrollOpacity() {
 }
 
 // ========== LCOE CALCULATIONS ==========
+function getScrollyLcoeWorker() {
+    if (!FEATURE_WORKER_LCOE || typeof Worker === 'undefined') return null;
+    if (lcoeWorker) return lcoeWorker;
+
+    lcoeWorker = new Worker(new URL('./workers/lcoe-worker.js', import.meta.url), { type: 'module' });
+    lcoeWorker.onmessage = (event) => {
+        const { type, requestId, payload } = event.data || {};
+        const pending = lcoeWorkerPending.get(requestId);
+        if (!pending) return;
+        lcoeWorkerPending.delete(requestId);
+        if (type === 'ERROR') {
+            pending.reject(new Error(payload?.message || 'Scrollytelling LCOE worker error'));
+            return;
+        }
+        pending.resolve(payload || null);
+    };
+    lcoeWorker.onerror = (event) => {
+        console.warn('Scrollytelling LCOE worker failed; using main-thread fallback.', event?.message || event);
+        lcoeWorkerReady = false;
+        lcoeWorkerReadyPromise = null;
+        lcoeWorkerPending.forEach((pending) => pending.reject(new Error('Scrollytelling LCOE worker crashed')));
+        lcoeWorkerPending.clear();
+    };
+
+    return lcoeWorker;
+}
+
+function postScrollyLcoeWorkerMessage(type, payload, timeoutMs = 12000) {
+    const worker = getScrollyLcoeWorker();
+    if (!worker) {
+        return Promise.reject(new Error('Scrollytelling LCOE worker unavailable'));
+    }
+
+    const requestId = ++lcoeWorkerRequestSeq;
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            lcoeWorkerPending.delete(requestId);
+            reject(new Error(`Scrollytelling worker timeout for ${type}`));
+        }, timeoutMs);
+
+        lcoeWorkerPending.set(requestId, {
+            resolve: (value) => {
+                clearTimeout(timer);
+                resolve(value);
+            },
+            reject: (err) => {
+                clearTimeout(timer);
+                reject(err);
+            }
+        });
+
+        worker.postMessage({ type, requestId, payload });
+    });
+}
+
+function serializeScrollyWaccMap() {
+    if (waccMode !== 'local' || !waccMap.size) return null;
+    const out = {};
+    waccMap.forEach((value, locationId) => {
+        if (Number.isFinite(value)) out[locationId] = value;
+    });
+    return out;
+}
+
+function serializeScrollyLocalCapexMap() {
+    if (capexMode !== 'local' || !localCapexMap.size) return null;
+    const out = {};
+    localCapexMap.forEach((entry, locationId) => {
+        if (!entry) return;
+        const solar = interpolateLocalCapex(lcoeOutlookYear, entry.solar);
+        const battery = interpolateLocalCapex(lcoeOutlookYear, entry.battery);
+        if (!Number.isFinite(solar) || !Number.isFinite(battery)) return;
+        out[locationId] = { solar, battery };
+    });
+    return out;
+}
+
+function buildScrollyWorkerCacheKey(targetCf) {
+    return JSON.stringify({
+        targetCf,
+        mode: { capexMode, waccMode, year: lcoeOutlookYear },
+        multipliers: lcoeOutlookMultipliers,
+        params: {
+            solarCapex: lcoeParams.solarCapex,
+            batteryCapex: lcoeParams.batteryCapex,
+            solarOpexPct: lcoeParams.solarOpexPct,
+            batteryOpexPct: lcoeParams.batteryOpexPct,
+            solarLife: lcoeParams.solarLife,
+            batteryLife: lcoeParams.batteryLife,
+            wacc: lcoeParams.wacc
+        }
+    });
+}
+
+async function ensureScrollyLcoeWorkerReady() {
+    if (!FEATURE_WORKER_LCOE) return false;
+    if (lcoeWorkerReady) return true;
+    if (lcoeWorkerReadyPromise) return lcoeWorkerReadyPromise;
+
+    lcoeWorkerReadyPromise = (async () => {
+        try {
+            const worker = getScrollyLcoeWorker();
+            if (!worker || !summaryData.length) return false;
+            await postScrollyLcoeWorkerMessage('INIT_DATA', { rows: summaryData }, 20000);
+            lcoeWorkerReady = true;
+            return true;
+        } catch (err) {
+            console.warn('Scrollytelling LCOE worker init failed; using fallback.', err);
+            lcoeWorkerReady = false;
+            return false;
+        } finally {
+            lcoeWorkerReadyPromise = null;
+        }
+    })();
+
+    return lcoeWorkerReadyPromise;
+}
+
+function scheduleScrollyLcoeWorkerCompute(cacheKey, targetCf) {
+    if (!FEATURE_WORKER_LCOE || lcoeWorkerInFlight.has(cacheKey)) return;
+    lcoeWorkerInFlight.add(cacheKey);
+
+    (async () => {
+        try {
+            const ready = await ensureScrollyLcoeWorkerReady();
+            if (!ready) return;
+            const response = await postScrollyLcoeWorkerMessage('COMPUTE_BEST_LCOE', {
+                targetCf,
+                params: lcoeParams,
+                multipliers: lcoeOutlookMultipliers,
+                waccByLocation: serializeScrollyWaccMap(),
+                localCapexByLocation: serializeScrollyLocalCapexMap()
+            });
+            const results = response?.results || [];
+            lcoeWorkerCache.set(cacheKey, results);
+        } catch (err) {
+            console.warn('Scrollytelling LCOE worker compute failed; using fallback.', err);
+        } finally {
+            lcoeWorkerInFlight.delete(cacheKey);
+        }
+    })();
+}
+
 function computeLcoeForAllLocations(targetCf) {
+    const perf = startPerf('scrolly-lcoe-compute', { targetCf, workerEnabled: FEATURE_WORKER_LCOE });
+    if (FEATURE_WORKER_LCOE) {
+        const cacheKey = buildScrollyWorkerCacheKey(targetCf);
+        const cached = lcoeWorkerCache.get(cacheKey);
+        scheduleScrollyLcoeWorkerCompute(cacheKey, targetCf);
+        if (cached?.length) {
+            const cloned = cached.map((row) => ({ ...row }));
+            endPerf(perf, { rows: cloned.length, source: 'worker-cache' });
+            return cloned;
+        }
+    }
+
     const results = [];
     const { solarCapex, batteryCapex, solarOpexPct, batteryOpexPct, solarLife, batteryLife, wacc } = lcoeParams;
     const globalSolarCapex = solarCapex * (lcoeOutlookMultipliers.solar || 1);
@@ -1915,6 +2373,7 @@ function computeLcoeForAllLocations(targetCf) {
         }
     });
 
+    endPerf(perf, { rows: results.length, source: 'main-thread' });
     return results;
 }
 
@@ -2013,6 +2472,13 @@ async function preloadWeeklyConfigs() {
     await Promise.allSettled(WEEKLY_CONFIGS.map(async (config) => {
         if (weeklySampleTableCache.has(config.id)) return;
         try {
+            if (FEATURE_FRAMECACHE) {
+                const cacheRows = await loadWeeklyFrameCache(config.id, currentWeeklySeason).catch(() => null);
+                if (cacheRows && cacheRows.length) {
+                    weeklySeasonCache.set(`${config.id}_${currentWeeklySeason}`, cacheRows);
+                    return;
+                }
+            }
             const wrapper = await loadSampleColumnar(config.solar, config.battery);
             weeklySampleTableCache.set(config.id, wrapper);
         } catch (e) {
@@ -2039,36 +2505,58 @@ async function updateWeeklyData(configId, seasonId, { silent = false, force = fa
     const run = async () => {
         if (!silent) updateLoadingStatus('Loading sample data...');
         try {
-            let wrapper = weeklySampleTableCache.get(config.id);
-            if (!wrapper) {
-                wrapper = await loadSampleColumnar(config.solar, config.battery);
-                weeklySampleTableCache.set(config.id, wrapper);
-            }
-            if (!wrapper || wrapper.numRows === 0) {
-                throw new Error(`No sample data available for ${config.id}`);
-            }
+            let seasonData = null;
+            let resolvedSeason = desiredSeason;
 
-            const resolvedSeason = resolveSeasonKey(desiredSeason, wrapper.getSeasons());
-            const seasonCacheKey = `${config.id}_${resolvedSeason}`;
-            let seasonData = weeklySeasonCache.get(seasonCacheKey);
-
-            if (!seasonData || force) {
-                seasonData = wrapper.getRowsForSeason(resolvedSeason);
-                ensureWeeklyCoordMap();
-                if (weeklyCoordMap) {
-                    seasonData.forEach(row => {
-                        const id = Number(row.location_id);
-                        if (Number.isFinite(id)) {
-                            row.location_id = id;
-                        }
-                        const c = weeklyCoordMap.get(id);
-                        if (c) {
-                            row.latitude = c.lat;
-                            row.longitude = c.lon;
-                        }
-                    });
+            if (FEATURE_FRAMECACHE) {
+                try {
+                    seasonData = await loadWeeklyFrameCache(config.id, desiredSeason);
+                    if (seasonData && seasonData.length) {
+                        resolvedSeason = resolveSeasonKey(desiredSeason, [desiredSeason]);
+                    }
+                } catch (frameErr) {
+                    console.warn(`Frame cache unavailable for ${config.id}/${desiredSeason}, falling back to legacy samples.`, frameErr);
+                    seasonData = null;
                 }
-                weeklySeasonCache.set(seasonCacheKey, seasonData);
+            }
+
+            if (!seasonData || !seasonData.length) {
+                let wrapper = weeklySampleTableCache.get(config.id);
+                if (!wrapper) {
+                    wrapper = await loadSampleColumnar(config.solar, config.battery);
+                    weeklySampleTableCache.set(config.id, wrapper);
+                }
+                if (!wrapper || wrapper.numRows === 0) {
+                    throw new Error(`No sample data available for ${config.id}`);
+                }
+
+                resolvedSeason = resolveSeasonKey(desiredSeason, wrapper.getSeasons());
+                const seasonCacheKey = `${config.id}_${resolvedSeason}`;
+                seasonData = weeklySeasonCache.get(seasonCacheKey);
+
+                if (!seasonData || force) {
+                    seasonData = wrapper.getRowsForSeason(resolvedSeason);
+                    ensureWeeklyCoordMap();
+                    if (weeklyCoordMap) {
+                        seasonData.forEach(row => {
+                            const id = Number(row.location_id);
+                            if (Number.isFinite(id)) {
+                                row.location_id = id;
+                            }
+                            const c = weeklyCoordMap.get(id);
+                            if (c) {
+                                row.latitude = c.lat;
+                                row.longitude = c.lon;
+                            }
+                        });
+                    }
+                    weeklySeasonCache.set(seasonCacheKey, seasonData);
+                }
+            }
+
+            const resolvedCacheKey = `${config.id}_${resolvedSeason}`;
+            if (seasonData?.length) {
+                weeklySeasonCache.set(resolvedCacheKey, seasonData);
             }
 
             if (requestId === weeklySampleRequestId) {

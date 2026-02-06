@@ -12,14 +12,15 @@ import {
     initMap, updateMap, updatePopulationPolygons, updatePopulationGeo,
     updateLcoeMap, updateCfMap, updateMapWithSampleFrame,
     setSampleLocationClickHandler, capitalRecoveryFactor, updatePopulationSimple,
-    initSubsetMap, renderSubsetMap, subsetMap, setAccessMetric, updatePotentialMap
+    initSubsetMap, renderSubsetMap, subsetMap, setAccessMetric, updatePotentialMap,
+    updateSupplyMap, setDualMapMode
 } from './map.js';
 import { initSampleDays, loadSampleWeekData, cleanupSampleDays } from './samples.js';
 import {
     capitalizeWord, formatNumber, formatCurrency, coordKey, roundedKey,
     haversineKm, updateToggleUI, capitalRecoveryFactor as crf
 } from './utils.js';
-import { ALL_FUELS, FUEL_COLORS, TX_WACC, TX_LIFE, BASE_LOAD_MW, LCOE_NO_DATA_COLOR, VIEW_MODE_EXPLANATIONS, CF_COLOR_SCALE, POTENTIAL_MULTIPLE_BUCKETS } from './constants.js';
+import { ALL_FUELS, FUEL_COLORS, TX_WACC, TX_LIFE, BASE_LOAD_MW, LCOE_NO_DATA_COLOR, VIEW_MODE_EXPLANATIONS, CF_COLOR_SCALE, POTENTIAL_MULTIPLE_BUCKETS, FEATURE_WORKER_LCOE } from './constants.js';
 import { createSharedPopup, buildPlantTooltip } from './tooltip.js';
 
 const d3 = window.d3;
@@ -40,8 +41,9 @@ let summaryStatsByConfig = new Map();
 let potentialData = [];
 let potentialDataLoaded = false;
 let potentialLevel = 'level1';
-let potentialDisplayMode = 'multiple';
+let potentialDisplayMode = 'total';
 let potentialLatBounds = { level1: null, level2: null };
+let potentialAreaById = new Map();
 
 let fossilPlants = [];
 let fossilCapacity = []; // Keep this as it's used in ensureFossilDataLoaded
@@ -60,7 +62,7 @@ let localCapexCache = new Map();
 let localCapexCacheYear = null;
 
 // State for population view overlay
-let populationChartCumulative = false;
+let populationChartCumulative = true;
 let lcoeTargetMode = 'utilization'; // 'utilization' or 'lcoe'
 let targetLcoeValue = 90; // $/MWh
 
@@ -69,6 +71,36 @@ let populationDataLoaded = false;
 let fossilDataLoaded = false;
 let electricityDataLoaded = false;
 let chartJsLoaded = false;
+let reliabilityThreshold = 90;
+
+function getHeapMb() {
+    const used = performance?.memory?.usedJSHeapSize;
+    return Number.isFinite(used) ? (used / 1048576) : null;
+}
+
+function startPerf(label, meta = {}) {
+    return {
+        label,
+        meta,
+        startMs: performance.now(),
+        startHeapMb: getHeapMb()
+    };
+}
+
+function endPerf(marker, extra = {}) {
+    if (!marker) return;
+    const endHeapMb = getHeapMb();
+    const durationMs = performance.now() - marker.startMs;
+    const heapDeltaMb = (Number.isFinite(endHeapMb) && Number.isFinite(marker.startHeapMb))
+        ? (endHeapMb - marker.startHeapMb)
+        : null;
+    console.debug(`[perf] ${marker.label}`, {
+        durationMs: Number(durationMs.toFixed(2)),
+        heapDeltaMb: Number.isFinite(heapDeltaMb) ? Number(heapDeltaMb.toFixed(3)) : null,
+        ...marker.meta,
+        ...extra
+    });
+}
 
 // Dynamic Chart.js loader
 async function ensureChartJsLoaded() {
@@ -121,6 +153,12 @@ async function ensurePotentialDataLoaded() {
         loading.classList.remove('hidden');
 
         potentialData = await loadPvoutPotentialCsv();
+        potentialAreaById = new Map();
+        potentialData.forEach(row => {
+            if (!Number.isFinite(row.location_id)) return;
+            const area = Number(row.zone_area_km2);
+            potentialAreaById.set(row.location_id, Number.isFinite(area) ? area : null);
+        });
         potentialDataLoaded = true;
 
         loading.classList.add('hidden');
@@ -289,6 +327,7 @@ async function ensurePopulationModeDataLoaded() {
 }
 
 // LCOE Display Mode Toggle (Delta vs Transmission Cost)
+let lcoeDisplayMode = 'delta';
 const lcoeDisplayModeButtons = document.querySelectorAll('#lcoe-display-mode button');
 if (lcoeDisplayModeButtons && lcoeDisplayModeButtons.length > 0) {
     lcoeDisplayModeButtons.forEach(btn => {
@@ -341,6 +380,14 @@ const DELTA_PERCENTILE = 0.95;
 let legendLock = false;
 let lockedColorInfo = null;
 let lastColorInfo = null;
+let lcoeWorker = null;
+let lcoeWorkerReady = false;
+let lcoeWorkerRequestSeq = 0;
+let lcoeWorkerReadyPromise = null;
+const lcoeWorkerPending = new Map();
+const lcoeWorkerBestCache = new Map();
+const lcoeWorkerCfCache = new Map();
+const lcoeWorkerInFlight = new Set();
 // Note: VIEW_MODE_EXPLANATIONS now imported from constants.js
 
 // DOM Elements
@@ -356,6 +403,10 @@ const primaryControls = document.getElementById('primary-controls'); // New: Pri
 const sampleControls = document.getElementById('sample-controls');
 const potentialControls = document.getElementById('potential-controls');
 const populationControls = document.getElementById('population-controls'); // New: Population Controls
+const populationSupplyControls = document.getElementById('population-supply-controls');
+const populationControlsToggle = document.getElementById('population-controls-toggle');
+const populationSupplyToggle = document.getElementById('population-supply-toggle');
+const populationSupplyPanel = document.getElementById('population-supply-panel');
 const potentialLevelButtons = document.querySelectorAll('#potential-level-toggle button');
 const potentialDisplayButtons = document.querySelectorAll('#potential-display-toggle button');
 const legendCapacity = document.getElementById('legend-capacity');
@@ -365,6 +416,23 @@ const legendLcoe = document.getElementById('legend-lcoe');
 const legendPopulation = document.getElementById('legend-population');
 const legendElectricity = document.getElementById('legend-electricity');
 const legendAccess = document.getElementById('legend-access');
+const legendStack = document.getElementById('legend-stack');
+const legendSupplyStack = document.getElementById('legend-supply-stack');
+const legendSupplyCapacity = document.getElementById('legend-supply-capacity');
+const legendSupplyLcoe = document.getElementById('legend-supply-lcoe');
+const legendSupplyLcoeTitle = document.getElementById('legend-supply-lcoe-title');
+const legendSupplyLcoeMin = document.getElementById('legend-supply-lcoe-min');
+const legendSupplyLcoeMid = document.getElementById('legend-supply-lcoe-mid');
+const legendSupplyLcoeMax = document.getElementById('legend-supply-lcoe-max');
+const legendSupplyLcoeRef = document.getElementById('legend-supply-lcoe-ref');
+const legendSupplyLcoeBar = document.getElementById('legend-supply-lcoe-bar');
+const legendSupplyLcoeNotes = document.getElementById('legend-supply-lcoe-notes');
+const legendSupplyPotential = document.getElementById('legend-supply-potential');
+const legendSupplyPotentialTitle = document.getElementById('legend-supply-potential-title');
+const legendSupplyPotentialBar = document.getElementById('legend-supply-potential-bar');
+const legendSupplyPotentialBuckets = document.getElementById('legend-supply-potential-buckets');
+const legendSupplyPotentialMin = document.getElementById('legend-supply-potential-min');
+const legendSupplyPotentialMax = document.getElementById('legend-supply-potential-max');
 const legendPotentialMin = document.getElementById('legend-potential-min');
 const legendPotentialMax = document.getElementById('legend-potential-max');
 const legendPotentialTitle = document.getElementById('legend-potential-title');
@@ -417,6 +485,12 @@ const targetLcoeInput = document.getElementById('target-lcoe-input');
 const populationBaseButtons = document.querySelectorAll('#population-base-toggle button');
 const populationOverlayButtons = document.querySelectorAll('#population-overlay-mode button');
 const populationDisplayButtons = document.querySelectorAll('#population-display-toggle button');
+const supplyPotentialLevelButtons = document.querySelectorAll('#supply-potential-level-toggle button');
+const supplyPotentialDisplayButtons = document.querySelectorAll('#supply-potential-display-toggle button');
+const populationViewToggle = document.getElementById('population-view-toggle');
+const reliabilityThresholdControl = document.getElementById('reliability-threshold-control');
+const reliabilityThresholdSlider = document.getElementById('reliability-threshold-slider');
+const reliabilityThresholdVal = document.getElementById('reliability-threshold-val');
 const legendPopMin = document.getElementById('legend-pop-min');
 const legendPopMax = document.getElementById('legend-pop-max');
 const populationFuelFilterWrapper = document.getElementById('plant-fuel-filter');
@@ -451,7 +525,7 @@ const locConfigTextEl = document.getElementById('loc-config-text');
 const locTxInfoEl = document.getElementById('loc-tx-info');
 
 // Charts
-const mapContainer = document.getElementById('map');
+const mapShell = document.getElementById('map-shell');
 const populationChartsContainer = document.getElementById('population-charts');
 const populationChartHistogram = document.getElementById('population-chart-histogram');
 const populationChartLatMetric = document.getElementById('population-chart-lat-metric');
@@ -465,6 +539,8 @@ const populationChartLatPopTitle = document.getElementById('population-chart-lat
 const populationChartLatPopLabel = document.getElementById('population-chart-lat-pop-label');
 const populationChartMetricLabel = document.getElementById('population-chart-metric-label');
 const populationChartLatPopHelper = document.getElementById('population-chart-lat-pop-helper');
+const chartTitleDemandLatitude = document.getElementById('chart-title-demand-latitude');
+const chartTitleSupplyLatitude = document.getElementById('chart-title-supply-latitude');
 
 // Sample Chart
 const sampleChartOverlay = document.getElementById('sample-chart-overlay');
@@ -494,6 +570,7 @@ let accessCharts = {
     supply: null,
     comparison: null
 };
+let accessMetric = 'reliability';
 
 // Access Charts DOM Elements
 const standardChartsContainer = document.getElementById('standard-charts-container');
@@ -508,7 +585,7 @@ const accessComparisonStat = document.getElementById('access-comparison-stat');
 const accessComparisonLabel = document.getElementById('access-comparison-label');
 let populationChartMetric = 'cf';
 let populationBaseLayer = 'population';
-let populationOverlayMode = 'none';
+let populationOverlayMode = 'cf';
 let populationFuelFilter = new Set(['coal', 'oil_gas', 'bioenergy', 'nuclear']);
 let plantStatusFilter = 'announced'; // 'announced' or 'existing'
 let locationPanelShowingChartSummary = false;
@@ -611,19 +688,30 @@ const ALL_LEGENDS = [
     legendLcoe,
     legendPopulation,
     legendElectricity,
-    legendAccess
+    legendAccess,
+    legendSupplyCapacity,
+    legendSupplyLcoe,
+    legendSupplyPotential
 ];
 
 function hideAllLegends() {
     ALL_LEGENDS.forEach(legend => {
         if (legend) legend.classList.add('hidden');
     });
+    if (legendSupplyStack) legendSupplyStack.classList.add('hidden');
 }
 
 function hidePopulationLegends() {
     [legendPopulation, legendElectricity, legendAccess].forEach(legend => {
         if (legend) legend.classList.add('hidden');
     });
+}
+
+function hideSupplyLegends() {
+    [legendSupplyCapacity, legendSupplyLcoe, legendSupplyPotential].forEach(legend => {
+        if (legend) legend.classList.add('hidden');
+    });
+    if (legendSupplyStack) legendSupplyStack.classList.add('hidden');
 }
 
 // Note: capitalizeWord, haversineKm, coordKey, formatNumber, formatCurrency imported from utils.js
@@ -677,6 +765,183 @@ function computeTransmissionMetrics(row, reference, delta) {
         breakevenPerGw,
         breakevenPerGwKm
     };
+}
+
+function getLcoeWorker() {
+    if (!FEATURE_WORKER_LCOE || typeof Worker === 'undefined') return null;
+    if (lcoeWorker) return lcoeWorker;
+
+    lcoeWorker = new Worker(new URL('./workers/lcoe-worker.js', import.meta.url), { type: 'module' });
+    lcoeWorker.onmessage = (event) => {
+        const { type, requestId, payload } = event.data || {};
+        const pending = lcoeWorkerPending.get(requestId);
+        if (!pending) return;
+        lcoeWorkerPending.delete(requestId);
+        if (type === 'ERROR') {
+            pending.reject(new Error(payload?.message || 'LCOE worker error'));
+            return;
+        }
+        pending.resolve(payload || null);
+    };
+    lcoeWorker.onerror = (event) => {
+        console.warn('LCOE worker crashed, using main-thread fallback.', event?.message || event);
+        lcoeWorkerReady = false;
+        lcoeWorkerReadyPromise = null;
+        lcoeWorkerPending.forEach((pending) => pending.reject(new Error('LCOE worker crashed')));
+        lcoeWorkerPending.clear();
+    };
+
+    return lcoeWorker;
+}
+
+function serializeWaccMap() {
+    if (!waccMap || !waccMap.size || waccMode !== 'local') return null;
+    const out = {};
+    waccMap.forEach((value, locationId) => {
+        if (Number.isFinite(value)) out[locationId] = value;
+    });
+    return out;
+}
+
+function serializeLocalCapexMap() {
+    if (!localCapexMap || !localCapexMap.size || capexMode !== 'local') return null;
+    const out = {};
+    localCapexMap.forEach((entry, locationId) => {
+        if (!entry) return;
+        const solar = interpolateLocalCapex(lcoeTimeYear, entry.solar);
+        const battery = interpolateLocalCapex(lcoeTimeYear, entry.battery);
+        if (!Number.isFinite(solar) || !Number.isFinite(battery)) return;
+        out[locationId] = { solar, battery };
+    });
+    return out;
+}
+
+function postLcoeWorkerMessage(type, payload, timeoutMs = 12000) {
+    const worker = getLcoeWorker();
+    if (!worker) {
+        return Promise.reject(new Error('LCOE worker unavailable'));
+    }
+
+    const requestId = ++lcoeWorkerRequestSeq;
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            lcoeWorkerPending.delete(requestId);
+            reject(new Error(`LCOE worker timeout for ${type}`));
+        }, timeoutMs);
+
+        lcoeWorkerPending.set(requestId, {
+            resolve: (value) => {
+                clearTimeout(timer);
+                resolve(value);
+            },
+            reject: (err) => {
+                clearTimeout(timer);
+                reject(err);
+            }
+        });
+
+        worker.postMessage({ type, requestId, payload });
+    });
+}
+
+function cloneWorkerResults(rows) {
+    return Array.isArray(rows) ? rows.map((row) => ({ ...row })) : [];
+}
+
+function buildWorkerCacheKey(kind, targetValue, params) {
+    return JSON.stringify({
+        kind,
+        targetValue,
+        mode: { waccMode, capexMode, year: lcoeTimeYear },
+        multipliers: lcoeCostMultipliers,
+        params: {
+            solarCapex: params.solarCapex,
+            batteryCapex: params.batteryCapex,
+            solarOpexPct: params.solarOpexPct,
+            batteryOpexPct: params.batteryOpexPct,
+            solarLife: params.solarLife,
+            batteryLife: params.batteryLife,
+            wacc: params.wacc,
+            ilr: params.ilr,
+            targetCf: params.targetCf
+        }
+    });
+}
+
+async function ensureLcoeWorkerReady() {
+    if (!FEATURE_WORKER_LCOE) return false;
+    if (lcoeWorkerReady) return true;
+    if (lcoeWorkerReadyPromise) return lcoeWorkerReadyPromise;
+
+    lcoeWorkerReadyPromise = (async () => {
+        try {
+            const worker = getLcoeWorker();
+            if (!worker || !summaryData.length) return false;
+            await postLcoeWorkerMessage('INIT_DATA', { rows: summaryData }, 20000);
+            lcoeWorkerReady = true;
+            return true;
+        } catch (err) {
+            console.warn('LCOE worker init failed, using main-thread fallback.', err);
+            lcoeWorkerReady = false;
+            return false;
+        } finally {
+            lcoeWorkerReadyPromise = null;
+        }
+    })();
+
+    return lcoeWorkerReadyPromise;
+}
+
+function scheduleBestLcoeWorkerCompute(key, targetCf, params) {
+    if (!FEATURE_WORKER_LCOE || lcoeWorkerInFlight.has(`best:${key}`)) return;
+    lcoeWorkerInFlight.add(`best:${key}`);
+
+    (async () => {
+        try {
+            const ready = await ensureLcoeWorkerReady();
+            if (!ready) return;
+            const payload = {
+                targetCf,
+                params,
+                costMultipliers: lcoeCostMultipliers,
+                waccByLocation: serializeWaccMap(),
+                localCapexByLocation: serializeLocalCapexMap()
+            };
+            const response = await postLcoeWorkerMessage('COMPUTE_BEST_LCOE', payload);
+            const results = response?.results || [];
+            lcoeWorkerBestCache.set(key, results);
+        } catch (err) {
+            console.warn('LCOE worker best-config compute failed, using fallback.', err);
+        } finally {
+            lcoeWorkerInFlight.delete(`best:${key}`);
+        }
+    })();
+}
+
+function scheduleCfAtTargetLcoeWorkerCompute(key, targetLcoe, params) {
+    if (!FEATURE_WORKER_LCOE || lcoeWorkerInFlight.has(`cf:${key}`)) return;
+    lcoeWorkerInFlight.add(`cf:${key}`);
+
+    (async () => {
+        try {
+            const ready = await ensureLcoeWorkerReady();
+            if (!ready) return;
+            const payload = {
+                targetLcoe,
+                params,
+                costMultipliers: lcoeCostMultipliers,
+                waccByLocation: serializeWaccMap(),
+                localCapexByLocation: serializeLocalCapexMap()
+            };
+            const response = await postLcoeWorkerMessage('COMPUTE_CF_AT_TARGET_LCOE', payload);
+            const results = response?.results || [];
+            lcoeWorkerCfCache.set(key, results);
+        } catch (err) {
+            console.warn('LCOE worker CF-at-target compute failed, using fallback.', err);
+        } finally {
+            lcoeWorkerInFlight.delete(`cf:${key}`);
+        }
+    })();
 }
 
 const LCOE_TIME_ANCHORS = (() => {
@@ -799,7 +1064,7 @@ function getRowCapex(row) {
 
 
 
-function computeBestLcoeByLocation(targetCf, params) {
+function computeBestLcoeByLocationLegacy(targetCf, params) {
     const results = [];
     locationIndex.forEach(rows => {
         const payloads = [];
@@ -856,7 +1121,7 @@ function computeBestLcoeByLocation(targetCf, params) {
 }
 
 // Similar to above, but for target LCOE mode: find config with CF closest to achieving target LCOE
-function computeCfAtTargetLcoe(targetLcoe, params) {
+function computeCfAtTargetLcoeLegacy(targetLcoe, params) {
     const results = [];
     locationIndex.forEach(rows => {
         let bestConfig = null;
@@ -901,6 +1166,34 @@ function computeCfAtTargetLcoe(targetLcoe, params) {
     return results;
 }
 
+function computeBestLcoeByLocation(targetCf, params) {
+    if (!FEATURE_WORKER_LCOE) {
+        return computeBestLcoeByLocationLegacy(targetCf, params);
+    }
+
+    const key = buildWorkerCacheKey('best', targetCf, params);
+    const cached = lcoeWorkerBestCache.get(key);
+    scheduleBestLcoeWorkerCompute(key, targetCf, params);
+    if (cached?.length) {
+        return cloneWorkerResults(cached);
+    }
+    return computeBestLcoeByLocationLegacy(targetCf, params);
+}
+
+function computeCfAtTargetLcoe(targetLcoe, params) {
+    if (!FEATURE_WORKER_LCOE) {
+        return computeCfAtTargetLcoeLegacy(targetLcoe, params);
+    }
+
+    const key = buildWorkerCacheKey('cf_at_target_lcoe', targetLcoe, params);
+    const cached = lcoeWorkerCfCache.get(key);
+    scheduleCfAtTargetLcoeWorkerCompute(key, targetLcoe, params);
+    if (cached?.length) {
+        return cloneWorkerResults(cached);
+    }
+    return computeCfAtTargetLcoeLegacy(targetLcoe, params);
+}
+
 function setLegendGradient(mode) {
     legendLcoeBar.classList.remove('legend-gradient-cost', 'legend-gradient-delta', 'legend-gradient-tx');
     if (mode === 'delta') {
@@ -912,6 +1205,82 @@ function setLegendGradient(mode) {
     }
 }
 
+function setSupplyLegendGradient(mode) {
+    if (!legendSupplyLcoeBar) return;
+    legendSupplyLcoeBar.classList.remove('legend-gradient-cost', 'legend-gradient-delta', 'legend-gradient-tx');
+    if (mode === 'delta') {
+        legendSupplyLcoeBar.classList.add('legend-gradient-delta');
+    } else if (mode === 'tx') {
+        legendSupplyLcoeBar.classList.add('legend-gradient-tx');
+    } else {
+        legendSupplyLcoeBar.classList.add('legend-gradient-cost');
+    }
+}
+
+function renderSupplyLegendFromInfo(info) {
+    if (!legendSupplyLcoeMin || !legendSupplyLcoeMid || !legendSupplyLcoeMax || !legendSupplyLcoeRef) return;
+    if (!info) {
+        legendSupplyLcoeMin.textContent = '--';
+        legendSupplyLcoeMid.textContent = '--';
+        legendSupplyLcoeMax.textContent = '--';
+        legendSupplyLcoeRef.textContent = 'Reference: --';
+        if (legendSupplyLcoeNotes) {
+            legendSupplyLcoeNotes.textContent = '';
+            legendSupplyLcoeNotes.classList.add('hidden');
+        }
+        if (legendSupplyLcoeTitle) legendSupplyLcoeTitle.textContent = 'LCOE ($/MWh)';
+        setSupplyLegendGradient('cost');
+        return;
+    }
+
+    if (legendSupplyLcoeTitle) {
+        legendSupplyLcoeTitle.textContent = info.title || 'LCOE ($/MWh)';
+    }
+    legendSupplyLcoeMin.textContent = info.minLabel || '--';
+    legendSupplyLcoeMid.textContent = info.midLabel || '--';
+    legendSupplyLcoeMax.textContent = info.maxLabel || '--';
+    legendSupplyLcoeRef.textContent = info.refLabel || 'Reference: --';
+    if (legendSupplyLcoeNotes) {
+        legendSupplyLcoeNotes.innerHTML = '';
+        const rows = [];
+        if (info.underflowLabel) {
+            rows.push({
+                color: info.underflowColor || '#0b5ea8',
+                text: info.underflowLabel
+            });
+        }
+        if (info.noDataLabel) {
+            rows.push({
+                color: LCOE_NO_DATA_COLOR,
+                text: info.noDataSuffix === false
+                    ? info.noDataLabel
+                    : `${info.noDataLabel} (no data / target not met)`
+            });
+        }
+        if (rows.length) {
+            rows.forEach(row => {
+                const wrapper = document.createElement('div');
+                wrapper.className = 'flex items-center gap-2';
+                const swatch = document.createElement('span');
+                swatch.style.backgroundColor = row.color;
+                swatch.style.display = 'inline-block';
+                swatch.style.width = '12px';
+                swatch.style.height = '12px';
+                swatch.style.borderRadius = '3px';
+                const label = document.createElement('span');
+                label.textContent = row.text;
+                wrapper.appendChild(swatch);
+                wrapper.appendChild(label);
+                legendSupplyLcoeNotes.appendChild(wrapper);
+            });
+            legendSupplyLcoeNotes.classList.remove('hidden');
+        } else {
+            legendSupplyLcoeNotes.classList.add('hidden');
+        }
+    }
+    setSupplyLegendGradient(info.gradient || 'cost');
+}
+
 function setViewModeExplanation(mode) {
     if (!viewModeExplainer) return;
     const message = VIEW_MODE_EXPLANATIONS[mode] || VIEW_MODE_EXPLANATIONS.capacity;
@@ -921,21 +1290,31 @@ function setViewModeExplanation(mode) {
 function updatePopulationOverlayControls(mode) {
     const popCfControls = document.getElementById('population-cf-controls');
     const popLcoeControls = document.getElementById('population-lcoe-controls');
+    const popPotentialControls = document.getElementById('population-potential-controls');
 
     // Show CF controls when CF overlay selected
     if (mode === 'cf') {
         if (popCfControls) popCfControls.classList.remove('hidden');
         if (popLcoeControls) popLcoeControls.classList.add('hidden');
+        if (popPotentialControls) popPotentialControls.classList.add('hidden');
     }
     // Show LCOE controls when LCOE overlay selected
     else if (mode === 'lcoe') {
         if (popCfControls) popCfControls.classList.add('hidden');
         if (popLcoeControls) popLcoeControls.classList.remove('hidden');
+        if (popPotentialControls) popPotentialControls.classList.add('hidden');
     }
-    // Hide both when no overlay
+    // Show Potential controls when Potential overlay selected
+    else if (mode === 'potential') {
+        if (popCfControls) popCfControls.classList.add('hidden');
+        if (popLcoeControls) popLcoeControls.classList.add('hidden');
+        if (popPotentialControls) popPotentialControls.classList.remove('hidden');
+    }
+    // Hide all when no overlay
     else {
         if (popCfControls) popCfControls.classList.add('hidden');
         if (popLcoeControls) popLcoeControls.classList.add('hidden');
+        if (popPotentialControls) popPotentialControls.classList.add('hidden');
     }
 
     // Legacy: Handle old overlay config if it exists
@@ -974,17 +1353,17 @@ function updatePopulationOverlayControls(mode) {
 function updatePopulationViewHelperCopy() {
     if (!populationViewHelper || !populationChartsCta) return;
     if (populationDisplayMode === 'charts') {
-        populationViewHelper.textContent = 'Charts summarise whichever base layer is selected (population or installed capacity) by percentile and latitude.';
+        populationViewHelper.textContent = 'Charts show demand by latitude, supply by latitude, and demand-weighted supply distributions for the selected layers.';
         populationChartsCta.textContent = 'Show map view';
     } else {
-        populationViewHelper.textContent = 'Map mode shows the chosen base layer directly; Charts condense the same information by percentile and latitude band.';
+        populationViewHelper.textContent = 'Map mode shows the chosen base layer directly; Charts summarize demand and supply by latitude and distribution.';
         populationChartsCta.textContent = 'Show charts';
     }
 }
 
 function showMapContainerOnly() {
-    const wasHidden = mapContainer?.classList.contains('hidden');
-    if (mapContainer) mapContainer.classList.remove('hidden');
+    const wasHidden = mapShell?.classList.contains('hidden');
+    if (mapShell) mapShell.classList.remove('hidden');
     if (populationChartsContainer) populationChartsContainer.classList.add('hidden');
     if (wasHidden) {
         // Give Leaflet a nudge to recalc sizes after being unhidden
@@ -993,10 +1372,41 @@ function showMapContainerOnly() {
 }
 
 function showPopulationChartsOnly() {
-    if (mapContainer) mapContainer.classList.add('hidden');
+    if (mapShell) mapShell.classList.add('hidden');
     if (populationChartsContainer) populationChartsContainer.classList.remove('hidden');
     // Hide all legends when showing charts
-    hidePopulationLegends();
+    hideAllLegends();
+    requestAnimationFrame(updatePopulationChartsBounds);
+}
+
+function togglePanelCollapse(panelEl, btnEl) {
+    if (!panelEl || !btnEl) return;
+    const isCollapsed = panelEl.classList.toggle('is-collapsed');
+    btnEl.setAttribute('aria-expanded', String(!isCollapsed));
+    btnEl.setAttribute('title', isCollapsed ? 'Expand panel' : 'Collapse panel');
+    if (currentViewMode === 'population' && populationDisplayMode === 'charts') {
+        requestAnimationFrame(updatePopulationChartsBounds);
+    }
+}
+
+function updatePopulationChartsBounds() {
+    if (!populationChartsContainer) return;
+    const gap = 16;
+    let leftPad = 16;
+    let rightPad = 16;
+
+    if (populationControls && !populationControls.classList.contains('hidden')) {
+        const leftRect = populationControls.getBoundingClientRect();
+        leftPad = Math.max(leftPad, leftRect.right + gap);
+    }
+
+    if (populationSupplyPanel && !populationSupplyPanel.classList.contains('hidden')) {
+        const rightRect = populationSupplyPanel.getBoundingClientRect();
+        rightPad = Math.max(rightPad, window.innerWidth - rightRect.left + gap);
+    }
+
+    populationChartsContainer.style.setProperty('--charts-left-pad', `${leftPad}px`);
+    populationChartsContainer.style.setProperty('--charts-right-pad', `${rightPad}px`);
 }
 
 function setLocationPanelChartSummary() {
@@ -1057,19 +1467,33 @@ function updatePopulationBaseToggleUI() {
         demandDescription.classList.toggle('hidden', populationBaseLayer !== 'plants');
     }
 
+    if (reliabilityThresholdControl) {
+        const showReliability = populationBaseLayer === 'uptime';
+        reliabilityThresholdControl.classList.toggle('hidden', !showReliability);
+        if (showReliability) {
+            if (reliabilityThresholdSlider) reliabilityThresholdSlider.value = reliabilityThreshold;
+            if (reliabilityThresholdVal) reliabilityThresholdVal.textContent = reliabilityThreshold;
+        }
+    }
+
     // Update chart titles based on base layer
     const titlePercentile = document.getElementById('chart-title-percentile');
-    const titleLatitude = document.getElementById('chart-title-latitude');
-    const titleDistribution = document.getElementById('chart-title-distribution');
+    const titleDemandLatitude = document.getElementById('chart-title-demand-latitude');
 
     if (populationBaseLayer === 'plants') {
         if (titlePercentile) titlePercentile.textContent = 'Metric by Displaceable Plant Capacity Percentile';
-        // Note: histogram title logic might be dynamic, check line 599
-        if (titleDistribution) titleDistribution.textContent = 'Displaceable Plant Capacity Distribution';
+        if (titleDemandLatitude) titleDemandLatitude.textContent = 'Displaceable Capacity by Latitude';
+    } else if (populationBaseLayer === 'access') {
+        if (titlePercentile) titlePercentile.textContent = 'People Without Access by Supply Metric';
+        if (titleDemandLatitude) titleDemandLatitude.textContent = 'People Without Access by Latitude';
+    } else if (populationBaseLayer === 'uptime') {
+        if (titlePercentile) titlePercentile.textContent = `People Below ${reliabilityThreshold}% Uptime by Supply Metric`;
+        if (titleDemandLatitude) titleDemandLatitude.textContent = `People Below ${reliabilityThreshold}% Uptime by Latitude`;
     } else {
         if (titlePercentile) titlePercentile.textContent = 'Metric by Population Percentile';
-        if (titleLatitude) titleLatitude.textContent = 'Metric by Latitude';
-        if (titleDistribution) titleDistribution.textContent = 'Population Distribution';
+        if (titleDemandLatitude) titleDemandLatitude.textContent = populationBaseLayer === 'electricity'
+            ? 'Electricity Demand by Latitude'
+            : 'Population by Latitude';
     }
 }
 
@@ -1164,6 +1588,21 @@ function updateChartOverlayToggleUI() {
     });
 }
 
+function syncPotentialToggleUI() {
+    if (potentialLevelButtons?.length) {
+        updateToggleUI(potentialLevelButtons, potentialLevel, 'level');
+    }
+    if (potentialDisplayButtons?.length) {
+        updateToggleUI(potentialDisplayButtons, potentialDisplayMode, 'display');
+    }
+    if (supplyPotentialLevelButtons?.length) {
+        updateToggleUI(supplyPotentialLevelButtons, potentialLevel, 'level');
+    }
+    if (supplyPotentialDisplayButtons?.length) {
+        updateToggleUI(supplyPotentialDisplayButtons, potentialDisplayMode, 'display');
+    }
+}
+
 function setPopulationChartMetric(mode) {
     const normalized = mode === 'lcoe' ? 'lcoe' : 'cf';
     populationChartMetric = normalized;
@@ -1179,9 +1618,14 @@ function setPopulationChartMetric(mode) {
 }
 
 function setPopulationBaseLayer(mode) {
-    const validModes = new Set(['population', 'plants', 'electricity', 'access']);
+    const validModes = new Set(['population', 'plants', 'electricity', 'access', 'uptime']);
     const normalized = validModes.has(mode) ? mode : 'population';
     populationBaseLayer = normalized;
+    if (normalized === 'access') {
+        applyAccessMetric('no_access_pop');
+    } else if (normalized === 'uptime') {
+        applyAccessMetric('reliability');
+    }
     updatePopulationBaseToggleUI();
     updateChartLayerToggleUI();
     updatePopulationFuelToggleUI();
@@ -1211,6 +1655,7 @@ function setPopulationDisplayMode(mode) {
     populationDisplayMode = normalized;
     updatePopulationDisplayToggleUI();
     updatePopulationViewHelperCopy();
+    setDualMapMode(currentViewMode === 'population' && populationDisplayMode === 'map');
     if (currentViewMode === 'population') {
         updatePopulationView();
     }
@@ -1228,14 +1673,21 @@ function moveLcoeControlsToOriginalPosition() {
 }
 
 function updatePopulationLegend(popData, overlayMode = 'none', baseLayer = 'population') {
+    if (currentViewMode !== 'population') return;
     const legendElecMin = document.getElementById('legend-elec-min');
     const legendElecMax = document.getElementById('legend-elec-max');
+    const legendAccessBar = document.getElementById('legend-access-bar');
+    const legendAccessTitle = document.getElementById('legend-access-title');
+    const legendAccessMin = document.getElementById('legend-access-min');
+    const legendAccessMid = document.getElementById('legend-access-mid');
+    const legendAccessMax = document.getElementById('legend-access-max');
+    const legendAccessNote = document.getElementById('legend-access-note');
 
     // Hide all by default
     hidePopulationLegends();
 
-    // Show Energy Access legend if access overlay is active OR if access is the base layer
-    if ((overlayMode === 'access' || baseLayer === 'access') && legendAccess) {
+    // Show Energy Access legend if access overlay is active OR if access/uptime is the base layer
+    if ((overlayMode === 'access' || baseLayer === 'access' || baseLayer === 'uptime') && legendAccess) {
         legendAccess.classList.remove('hidden');
     }
 
@@ -1250,15 +1702,67 @@ function updatePopulationLegend(popData, overlayMode = 'none', baseLayer = 'popu
             if (legendElecMax) legendElecMax.textContent = maxTwh > 0 ? maxTwh.toFixed(1) + ' TWh' : '--';
         }
         legendElectricity.classList.remove('hidden');
-    } else if (baseLayer === 'access') {
+    } else if (baseLayer === 'plants') {
+        // No population/electricity legend for plant bubbles view
+        return;
+    } else if (baseLayer === 'access' || baseLayer === 'uptime') {
         // Energy Access legend is already shown above, don't show population
         // Just update note if present
+        const legendAccessToggle = document.getElementById('legend-access-toggle');
+        if (legendAccessToggle) {
+            // Hide toggle when access/reliability are separate tabs
+            legendAccessToggle.classList.add('hidden');
+        }
+        if (legendAccessBar) {
+            if (accessMetric === 'no_access_pop') {
+                legendAccessBar.style.background = 'linear-gradient(to right, #1e293b, #991b1b, #ff0000)';
+            } else if (accessMetric === 'no_access') {
+                legendAccessBar.style.background = 'linear-gradient(to right, #ef4444, #eab308, #22c55e)';
+            } else {
+                legendAccessBar.style.background = 'linear-gradient(to right, #ef4444, #6b7280)';
+            }
+        }
+        if (legendAccessTitle) {
+            legendAccessTitle.textContent = accessMetric === 'no_access_pop'
+                ? 'Population Without Access'
+                : 'Grid Reliability';
+        }
+        if (legendAccessMin && legendAccessMid && legendAccessMax) {
+            if (accessMetric === 'no_access_pop') {
+                legendAccessMin.textContent = 'Low';
+                legendAccessMid.textContent = '';
+                legendAccessMax.textContent = 'High';
+            } else {
+                legendAccessMin.textContent = '0%';
+                legendAccessMid.textContent = '';
+                legendAccessMax.textContent = '100%';
+            }
+        }
+        if (legendAccessNote) {
+            legendAccessNote.textContent = accessMetric === 'no_access_pop'
+                ? 'Dark grey: universal access'
+                : 'No Data (HREA not covered)';
+        }
         if (legendPopLayerNote) {
-            legendPopLayerNote.textContent = 'Color: average grid uptime (reliability) for each cell.';
-            legendPopLayerNote.classList.remove('text-slate-500');
-            legendPopLayerNote.classList.add('text-slate-300');
+            if (accessMetric === 'no_access_pop') {
+                legendPopLayerNote.textContent = 'Color: population without electricity access (log scale).';
+                legendPopLayerNote.classList.remove('text-slate-500');
+                legendPopLayerNote.classList.add('text-slate-300');
+            } else if (accessMetric === 'no_access') {
+                legendPopLayerNote.textContent = 'Color: share of population without access (percent).';
+                legendPopLayerNote.classList.remove('text-slate-500');
+                legendPopLayerNote.classList.add('text-slate-300');
+            } else {
+                legendPopLayerNote.textContent = 'Color: average grid uptime (reliability) for each cell.';
+                legendPopLayerNote.classList.remove('text-slate-500');
+                legendPopLayerNote.classList.add('text-slate-300');
+            }
         }
     } else {
+        const legendAccessToggle = document.getElementById('legend-access-toggle');
+        if (legendAccessToggle) {
+            legendAccessToggle.classList.remove('hidden');
+        }
         // Show population legend
         if (!legendPopulation || !legendPopMin || !legendPopMax) return;
         if (!popData || popData.length === 0) {
@@ -1288,6 +1792,68 @@ function updatePopulationLegend(popData, overlayMode = 'none', baseLayer = 'popu
                 legendPopLayerNote.classList.add('text-slate-500');
             }
         }
+    }
+}
+
+function updateSupplyLegend(overlayMode = 'none', lcoeColorInfo = null, potentialState = null) {
+    if (currentViewMode !== 'population' || populationDisplayMode !== 'map') {
+        hideSupplyLegends();
+        return;
+    }
+    if (!legendSupplyStack) return;
+    if (!overlayMode || overlayMode === 'none') {
+        hideSupplyLegends();
+        return;
+    }
+
+    legendSupplyStack.classList.remove('hidden');
+    if (legendSupplyCapacity) legendSupplyCapacity.classList.add('hidden');
+    if (legendSupplyLcoe) legendSupplyLcoe.classList.add('hidden');
+    if (legendSupplyPotential) legendSupplyPotential.classList.add('hidden');
+
+    if (overlayMode === 'cf') {
+        if (legendSupplyCapacity) legendSupplyCapacity.classList.remove('hidden');
+    } else if (overlayMode === 'lcoe') {
+        if (legendSupplyLcoe) legendSupplyLcoe.classList.remove('hidden');
+        renderSupplyLegendFromInfo(lcoeColorInfo);
+    } else if (overlayMode === 'potential') {
+        if (legendSupplyPotential) legendSupplyPotential.classList.remove('hidden');
+        const hasData = potentialState && potentialState.valueCount;
+        const isMultiple = potentialState?.isMultiple;
+        if (legendSupplyPotentialTitle) {
+            legendSupplyPotentialTitle.textContent = isMultiple
+                ? 'Solar Generation Potential / Electricity Demand Today (x multiple)'
+                : 'Solar Generation Potential (TWh/yr)';
+        }
+        if (legendSupplyPotentialBar) {
+            legendSupplyPotentialBar.classList.toggle('legend-gradient-potential-multiple', Boolean(isMultiple));
+            legendSupplyPotentialBar.classList.toggle('legend-gradient-potential', !isMultiple);
+            legendSupplyPotentialBar.classList.toggle('hidden', Boolean(isMultiple));
+        }
+        if (legendSupplyPotentialBuckets) {
+            legendSupplyPotentialBuckets.classList.toggle('hidden', !isMultiple);
+            if (isMultiple) {
+                const noData = `<div class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:#6b7280"></span><span>No data</span></div>`;
+                const items = POTENTIAL_MULTIPLE_BUCKETS.map(bucket => (
+                    `<div class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm" style="background:${bucket.color}"></span><span>${bucket.label}</span></div>`
+                ));
+                legendSupplyPotentialBuckets.innerHTML = `${items.join('')}${noData}`;
+            }
+        }
+        if (legendSupplyPotentialMin) {
+            legendSupplyPotentialMin.textContent = hasData && !isMultiple
+                ? formatNumber(potentialState.min, 2)
+                : '';
+            legendSupplyPotentialMin.classList.toggle('hidden', Boolean(isMultiple));
+        }
+        if (legendSupplyPotentialMax) {
+            legendSupplyPotentialMax.textContent = hasData && !isMultiple
+                ? formatNumber(potentialState.max, 2)
+                : '';
+            legendSupplyPotentialMax.classList.toggle('hidden', Boolean(isMultiple));
+        }
+    } else {
+        hideSupplyLegends();
     }
 }
 
@@ -1571,27 +2137,53 @@ function queueLcoeUpdate() {
     }, 150);
 }
 
-function buildPopulationMetrics(enrichedPop, overlayMode, cfData, lcoeData) {
+function getPotentialMetricFromRow(row, potentialState) {
+    if (!row || !potentialState) return null;
+    const level = potentialState.level || 'level1';
+    const key = level === 'level2' ? 'pvout_level2_twh_y' : 'pvout_level1_twh_y';
+    const total = Number(row[key] || 0);
+    const latVal = Number(row.latitude);
+    const bounds = potentialState.latBounds;
+    if (bounds && (!Number.isFinite(latVal) || latVal < bounds.min || latVal > bounds.max)) {
+        return null;
+    }
+    if (!Number.isFinite(total)) return null;
+    if (potentialState.displayMode === 'multiple') {
+        const demandRow = potentialState.demandMap ? potentialState.demandMap.get(row.location_id) : null;
+        const demandKwh = demandRow ? Number(demandRow.annual_demand_kwh || 0) : 0;
+        const demandTwh = demandKwh > 0 ? demandKwh / 1e9 : 0;
+        if (demandTwh <= 0) return null;
+        return total / demandTwh;
+    }
+    return total;
+}
+
+function buildPopulationMetrics(enrichedPop, overlayMode, cfData, lcoeData, potentialState = null) {
     const cfByCoord = new Map(cfData.map(d => [coordKey(d.latitude, d.longitude), d]));
     const lcoeByCoord = new Map(lcoeData.map(d => [coordKey(d.latitude, d.longitude), d]));
+    const potentialById = potentialState?.data ? new Map(potentialState.data.map(d => [d.location_id, d])) : null;
+    const potentialByCoord = potentialState?.data ? new Map(potentialState.data.map(d => [coordKey(d.latitude, d.longitude), d])) : null;
     return enrichedPop.map((p, idx) => {
         const key = coordKey(p.latitude, p.longitude);
         const cfRow = cfByCoord.get(key);
         const lcoeRow = lcoeByCoord.get(key);
+        const potentialRow = potentialById?.get(p.location_id) || potentialByCoord?.get(key);
         const weight = Math.max(0, p.population_2020 || 0);
         let metricVal;
         if (overlayMode === 'cf') {
             metricVal = cfRow?.annual_cf;
         } else if (overlayMode === 'lcoe') {
             metricVal = lcoeRow?.lcoe;
+        } else if (overlayMode === 'potential') {
+            metricVal = getPotentialMetricFromRow(potentialRow, potentialState);
         } else {
             metricVal = weight;
         }
-        if ((overlayMode === 'cf' || overlayMode === 'lcoe') && !Number.isFinite(metricVal)) {
+        if ((overlayMode === 'cf' || overlayMode === 'lcoe' || overlayMode === 'potential') && !Number.isFinite(metricVal)) {
             return null;
         }
         // Get location_id from cfRow or lcoeRow (they should have it)
-        const location_id = cfRow?.location_id ?? lcoeRow?.location_id ?? idx;
+        const location_id = cfRow?.location_id ?? lcoeRow?.location_id ?? potentialRow?.location_id ?? p.location_id ?? idx;
         return {
             location_id,
             latitude: p.latitude,
@@ -1599,14 +2191,21 @@ function buildPopulationMetrics(enrichedPop, overlayMode, cfData, lcoeData) {
             metric: metricVal,
             weight
         };
-    }).filter(m => (overlayMode === 'cf' || overlayMode === 'lcoe') ? Number.isFinite(m.metric) : m.weight > 0);
+    }).filter(m => {
+        if (!m) return false;
+        if (overlayMode === 'cf' || overlayMode === 'lcoe' || overlayMode === 'potential') {
+            return Number.isFinite(m.metric);
+        }
+        return m.weight > 0;
+    });
 }
 
 // Note: FUEL_COLORS now imported from constants.js
 
-function buildPlantMetrics(capacityRows, overlayMode, cfData, lcoeData, selectedFuels, statusFilter) {
+function buildPlantMetrics(capacityRows, overlayMode, cfData, lcoeData, selectedFuels, statusFilter, potentialState = null) {
     const cfById = new Map(cfData.map(d => [d.location_id, d]));
     const lcoeById = new Map(lcoeData.map(d => [d.location_id, d]));
+    const potentialById = potentialState?.data ? new Map(potentialState.data.map(d => [d.location_id, d])) : null;
     const fuelSet = selectedFuels && selectedFuels.size ? selectedFuels : new Set(ALL_FUELS);
     const suffix = statusFilter ? capitalizeWord(statusFilter) : 'Announced';
 
@@ -1621,6 +2220,9 @@ function buildPlantMetrics(capacityRows, overlayMode, cfData, lcoeData, selected
                 metricVal = cfById.get(row.location_id)?.annual_cf;
             } else if (overlayMode === 'lcoe') {
                 metricVal = lcoeById.get(row.location_id)?.lcoe;
+            } else if (overlayMode === 'potential') {
+                const potentialRow = potentialById?.get(row.location_id);
+                metricVal = getPotentialMetricFromRow(potentialRow, potentialState);
             } else {
                 // If no overlay, metric is just capacity? Or just weight?
                 // For Percentile chart with no overlay, usually we sort by capacity?
@@ -1628,7 +2230,7 @@ function buildPlantMetrics(capacityRows, overlayMode, cfData, lcoeData, selected
                 metricVal = weight;
             }
 
-            if ((overlayMode === 'cf' || overlayMode === 'lcoe') && !Number.isFinite(metricVal)) {
+            if ((overlayMode === 'cf' || overlayMode === 'lcoe' || overlayMode === 'potential') && !Number.isFinite(metricVal)) {
                 return null;
             }
 
@@ -1643,7 +2245,64 @@ function buildPlantMetrics(capacityRows, overlayMode, cfData, lcoeData, selected
         }).filter(Boolean);
     });
 }
-function buildStackedHistogram(metrics, overlayMode, selectedFuels, bucketCount = 50) {
+
+function getPeopleWithoutAccess(row) {
+    if (!row?.pop_bins) return 0;
+    const val = row.pop_bins[0];
+    return Number.isFinite(val) ? val : 0;
+}
+
+function getPeopleBelowUptime(row, threshold) {
+    if (!row?.pop_bins) return 0;
+    const limit = Number.isFinite(threshold) ? threshold : 90;
+    let sum = 0;
+    Object.entries(row.pop_bins).forEach(([midpoint, pop]) => {
+        const mid = Number(midpoint);
+        const val = Number(pop) || 0;
+        if (Number.isFinite(mid) && mid < limit) {
+            sum += val;
+        }
+    });
+    return sum;
+}
+
+function buildReliabilityMetrics(reliabilityRows, overlayMode, cfData, lcoeData, potentialState = null, mode = 'access') {
+    const cfById = new Map(cfData.map(d => [d.location_id, d]));
+    const lcoeById = new Map(lcoeData.map(d => [d.location_id, d]));
+    const potentialById = potentialState?.data ? new Map(potentialState.data.map(d => [d.location_id, d])) : null;
+
+    return reliabilityRows.map((row, idx) => {
+        const weight = mode === 'uptime'
+            ? getPeopleBelowUptime(row, reliabilityThreshold)
+            : getPeopleWithoutAccess(row);
+        if (!weight || weight <= 0) return null;
+
+        let metricVal;
+        if (overlayMode === 'cf') {
+            metricVal = cfById.get(row.location_id)?.annual_cf;
+        } else if (overlayMode === 'lcoe') {
+            metricVal = lcoeById.get(row.location_id)?.lcoe;
+        } else if (overlayMode === 'potential') {
+            const potentialRow = potentialById?.get(row.location_id);
+            metricVal = getPotentialMetricFromRow(potentialRow, potentialState);
+        } else {
+            metricVal = weight;
+        }
+
+        if ((overlayMode === 'cf' || overlayMode === 'lcoe' || overlayMode === 'potential') && !Number.isFinite(metricVal)) {
+            return null;
+        }
+
+        return {
+            location_id: row.location_id ?? idx,
+            latitude: row.latitude,
+            longitude: row.longitude,
+            metric: metricVal,
+            weight
+        };
+    }).filter(Boolean);
+}
+function buildStackedHistogram(metrics, overlayMode, selectedFuels, bucketCount = 50, options = {}) {
     if (!metrics.length) return { labels: [], datasets: [] };
 
     // Valid metrics
@@ -1689,7 +2348,13 @@ function buildStackedHistogram(metrics, overlayMode, selectedFuels, bucketCount 
     // Labels
     const labels = buckets.map(b => {
         const midpoint = (b.min + b.max) / 2;
-        return overlayMode === 'cf' ? `${(midpoint * 100).toFixed(1)}%` : `$${midpoint.toFixed(0)}`;
+        if (overlayMode === 'cf') return `${(midpoint * 100).toFixed(1)}%`;
+        if (overlayMode === 'lcoe') return `$${midpoint.toFixed(0)}`;
+        if (overlayMode === 'potential') {
+            const isMultiple = options.potentialDisplayMode === 'multiple';
+            return isMultiple ? `${midpoint.toFixed(2)}×` : `${midpoint.toFixed(1)}`;
+        }
+        return midpoint.toFixed(1);
     });
 
     // Datasets
@@ -1703,12 +2368,12 @@ function buildStackedHistogram(metrics, overlayMode, selectedFuels, bucketCount 
     return { labels, datasets, buckets };
 }
 
-function buildWeightedHistogram(metrics, overlayMode, bucketCount = 50) {
+function buildWeightedHistogram(metrics, overlayMode, bucketCount = 50, options = {}) {
     // Build histogram with CF or LCOE on x-axis and population/capacity on y-axis
     if (!metrics.length) return { labels: [], data: [] };
 
     // For overlays (CF or LCOE), bucket by the metric value
-    if (overlayMode === 'cf' || overlayMode === 'lcoe') {
+    if (overlayMode === 'cf' || overlayMode === 'lcoe' || overlayMode === 'potential') {
         // Filter metrics with valid metric values
         const validMetrics = metrics.filter(m => Number.isFinite(m.metric));
         if (!validMetrics.length) return { labels: [], data: [] };
@@ -1745,8 +2410,13 @@ function buildWeightedHistogram(metrics, overlayMode, bucketCount = 50) {
             const midpoint = (b.min + b.max) / 2;
             if (overlayMode === 'cf') {
                 return `${(midpoint * 100).toFixed(1)}%`;
-            } else {
+            } else if (overlayMode === 'lcoe') {
                 return `$${midpoint.toFixed(0)}`;
+            } else if (overlayMode === 'potential') {
+                const isMultiple = options.potentialDisplayMode === 'multiple';
+                return isMultiple ? `${midpoint.toFixed(2)}×` : `${midpoint.toFixed(1)}`;
+            } else {
+                return midpoint.toFixed(1);
             }
         });
         const data = buckets.map(b => b.weight);
@@ -1808,6 +2478,174 @@ function buildWeightedLatitudeHistogram(metrics, bucketCount = 100) {
     };
 }
 
+function buildSupplyMetricRows(overlayMode, cfData, lcoeData, potentialState = null) {
+    if (overlayMode === 'cf') {
+        return cfData
+            .map(row => ({
+                location_id: row.location_id,
+                latitude: row.latitude,
+                longitude: row.longitude,
+                metric: row.annual_cf,
+                availabilityWeight: Number.isFinite(potentialAreaById.get(row.location_id))
+                    ? potentialAreaById.get(row.location_id)
+                    : 1
+            }))
+            .filter(r => Number.isFinite(r.metric));
+    }
+    if (overlayMode === 'lcoe') {
+        return lcoeData
+            .map(row => ({
+                location_id: row.location_id,
+                latitude: row.latitude,
+                longitude: row.longitude,
+                metric: row.lcoe,
+                availabilityWeight: Number.isFinite(potentialAreaById.get(row.location_id))
+                    ? potentialAreaById.get(row.location_id)
+                    : 1
+            }))
+            .filter(r => Number.isFinite(r.metric));
+    }
+    if (overlayMode === 'potential') {
+        const rows = potentialState?.data || [];
+        return rows.map(row => {
+            const metricVal = getPotentialMetricFromRow(row, potentialState);
+            if (!Number.isFinite(metricVal)) return null;
+            const area = Number(row.zone_area_km2);
+            const availabilityWeight = Number.isFinite(area) && area > 0 ? area : 1;
+            return {
+                location_id: row.location_id,
+                latitude: row.latitude,
+                longitude: row.longitude,
+                metric: metricVal,
+                availabilityWeight
+            };
+        }).filter(Boolean);
+    }
+    return [];
+}
+
+function buildHistogramWithAvailability(demandMetrics, supplyMetrics, overlayMode, bucketCount = 50, options = {}) {
+    const validDemand = (demandMetrics || []).filter(m => Number.isFinite(m.metric) && (m.weight || 0) > 0);
+    const validSupply = (supplyMetrics || []).filter(m => Number.isFinite(m.metric));
+
+    const allValues = [
+        ...validDemand.map(m => m.metric),
+        ...validSupply.map(m => m.metric)
+    ];
+    if (!allValues.length) {
+        return { labels: [], demandShare: [], supplyShare: [], buckets: [] };
+    }
+
+    let minMetric = Math.min(...allValues);
+    let maxMetric = Math.max(...allValues);
+    if (!Number.isFinite(minMetric) || !Number.isFinite(maxMetric)) {
+        return { labels: [], demandShare: [], supplyShare: [], buckets: [] };
+    }
+    if (minMetric === maxMetric) {
+        maxMetric = minMetric + 1;
+    }
+
+    const bucketSize = (maxMetric - minMetric) / bucketCount;
+    const buckets = Array.from({ length: bucketCount }, (_, i) => ({
+        min: minMetric + i * bucketSize,
+        max: minMetric + (i + 1) * bucketSize,
+        demandWeight: 0,
+        supplyWeight: 0
+    }));
+
+    validDemand.forEach(m => {
+        const idx = Math.min(bucketCount - 1, Math.floor((m.metric - minMetric) / bucketSize));
+        buckets[idx].demandWeight += m.weight || 0;
+    });
+    validSupply.forEach(m => {
+        const weight = Number.isFinite(m.availabilityWeight) ? m.availabilityWeight : 1;
+        const idx = Math.min(bucketCount - 1, Math.floor((m.metric - minMetric) / bucketSize));
+        buckets[idx].supplyWeight += weight;
+    });
+
+    const demandTotal = buckets.reduce((sum, b) => sum + b.demandWeight, 0);
+    const supplyTotal = buckets.reduce((sum, b) => sum + b.supplyWeight, 0);
+
+    const labels = buckets.map(b => {
+        const midpoint = (b.min + b.max) / 2;
+        if (overlayMode === 'cf') return `${(midpoint * 100).toFixed(1)}%`;
+        if (overlayMode === 'lcoe') return `$${midpoint.toFixed(0)}`;
+        if (overlayMode === 'potential') {
+            const isMultiple = options.potentialDisplayMode === 'multiple';
+            return isMultiple ? `${midpoint.toFixed(2)}×` : `${midpoint.toFixed(1)}`;
+        }
+        return midpoint.toFixed(1);
+    });
+
+    const demandShare = buckets.map(b => (demandTotal > 0 ? (b.demandWeight / demandTotal) * 100 : 0));
+    const supplyShare = buckets.map(b => (supplyTotal > 0 ? (b.supplyWeight / supplyTotal) * 100 : 0));
+
+    return { labels, demandShare, supplyShare, buckets };
+}
+
+function buildLatitudeSupplyHistogram(supplyRows, bucketCount = 100) {
+    const totalWeight = supplyRows.reduce((sum, m) => sum + (m.metric || 0), 0);
+    if (!totalWeight) return { labels: [], data: [] };
+
+    const bucketSize = 180 / bucketCount;
+    const buckets = Array.from({ length: bucketCount }, (_, i) => ({
+        min: -90 + i * bucketSize,
+        max: -90 + (i + 1) * bucketSize,
+        weight: 0
+    }));
+
+    supplyRows.forEach(m => {
+        if (!Number.isFinite(m.latitude)) return;
+        const idx = Math.min(bucketCount - 1, Math.max(0, Math.floor((m.latitude + 90) / bucketSize)));
+        buckets[idx].weight += m.metric || 0;
+    });
+
+    const labels = buckets.map(b => `${((b.min + b.max) / 2).toFixed(1)}°`);
+    const data = buckets.map(b => (b.weight / totalWeight) * 100);
+    return {
+        labels: labels.reverse(),
+        data: data.reverse()
+    };
+}
+
+function quantile(sorted, q) {
+    if (!sorted.length) return null;
+    const pos = (sorted.length - 1) * q;
+    const base = Math.floor(pos);
+    const rest = pos - base;
+    if (sorted[base + 1] !== undefined) {
+        return sorted[base] + rest * (sorted[base + 1] - sorted[base]);
+    }
+    return sorted[base];
+}
+
+function computeLatBandStats(rows, bandSize = 5) {
+    const bands = new Map();
+    rows.forEach(r => {
+        if (!Number.isFinite(r.latitude) || !Number.isFinite(r.metric)) return;
+        const idx = Math.floor((r.latitude + 90) / bandSize);
+        const bandKey = Math.max(0, Math.min(Math.floor(180 / bandSize) - 1, idx));
+        if (!bands.has(bandKey)) bands.set(bandKey, []);
+        bands.get(bandKey).push(r.metric);
+    });
+
+    const stats = [];
+    bands.forEach((values, bandKey) => {
+        const sorted = values.slice().sort((a, b) => a - b);
+        const min = -90 + bandKey * bandSize;
+        const max = min + bandSize;
+        const lat = (min + max) / 2;
+        stats.push({
+            lat,
+            p25: quantile(sorted, 0.25),
+            p50: quantile(sorted, 0.5),
+            p75: quantile(sorted, 0.75)
+        });
+    });
+
+    return stats.sort((a, b) => a.lat - b.lat);
+}
+
 // ==================== ACCESS CHARTS ====================
 
 /**
@@ -1849,7 +2687,7 @@ function buildGridUptimeHistogram(reliabilityData) {
         return `${low.toFixed(0)}-${high.toFixed(0)}%`;
     });
 
-    const data = sortedKeys.map(k => (globalBins[k] / totalPop) * 100);
+    const data = sortedKeys.map(k => globalBins[k] / 1e6);
 
     const buckets = sortedKeys.map(k => ({
         midpoint: k,
@@ -1930,7 +2768,7 @@ function buildSolarVsGridComparison(reliabilityData, cfData) {
 
     const distributionData = {
         labels: buckets.map(b => `${b.min > 0 ? '+' : ''}${b.min}%`),
-        data: buckets.map(b => popTotal > 0 ? (b.pop / popTotal) * 100 : 0)
+        data: buckets.map(b => b.pop / 1e6)
     };
 
     return { popBetterWithSolar, popTotal, pctBetter, distributionData };
@@ -1957,7 +2795,7 @@ async function renderAccessCharts(populationData, reliabilityData, cfData, lcoeD
             data: {
                 labels: uptimeHist.labels,
                 datasets: [{
-                    label: 'Population Share (%)',
+                    label: 'Population (millions)',
                     data: uptimeHist.data,
                     backgroundColor: '#22c55e',
                     borderColor: '#16a34a',
@@ -1971,13 +2809,13 @@ async function renderAccessCharts(populationData, reliabilityData, cfData, lcoeD
                     legend: { display: false },
                     tooltip: {
                         callbacks: {
-                            label: (ctx) => `${ctx.parsed.y.toFixed(1)}% of population`
+                            label: (ctx) => `${ctx.parsed.y.toFixed(2)}M people`
                         }
                     }
                 },
                 scales: {
                     x: { title: { display: true, text: 'Grid Uptime (%)' } },
-                    y: { title: { display: true, text: 'Share of Population (%)' } }
+                    y: { title: { display: true, text: 'Population (millions)' } }
                 }
             }
         });
@@ -1992,9 +2830,9 @@ async function renderAccessCharts(populationData, reliabilityData, cfData, lcoeD
     }
     if (accessChartSupplyDesc) {
         accessChartSupplyDesc.textContent = isCf
-            ? 'Distribution of solar capacity factor weighted by population'
+            ? 'Distribution of solar capacity factor weighted by population (millions)'
             : isLcoe
-                ? 'Distribution of solar LCOE weighted by population'
+                ? 'Distribution of solar LCOE weighted by population (millions)'
                 : 'Enable CF or LCOE overlay to see supply layer distribution';
     }
 
@@ -2037,7 +2875,7 @@ async function renderAccessCharts(populationData, reliabilityData, cfData, lcoeD
         });
 
         const labels = buckets.map(b => isCf ? `${((b.min + b.max) / 2 * 100).toFixed(0)}%` : `$${((b.min + b.max) / 2).toFixed(0)}`);
-        const data = buckets.map(b => (b.pop / totalPop) * 100);
+        const data = buckets.map(b => b.pop / 1e6);
 
         if (accessCharts.supply) {
             accessCharts.supply.data.labels = labels;
@@ -2050,7 +2888,7 @@ async function renderAccessCharts(populationData, reliabilityData, cfData, lcoeD
                 data: {
                     labels,
                     datasets: [{
-                        label: 'Population Share (%)',
+                        label: 'Population (millions)',
                         data,
                         backgroundColor: isCf ? '#fbbf24' : '#10b981',
                         borderColor: isCf ? '#f59e0b' : '#059669',
@@ -2063,7 +2901,7 @@ async function renderAccessCharts(populationData, reliabilityData, cfData, lcoeD
                     plugins: { legend: { display: false } },
                     scales: {
                         x: { title: { display: true, text: isCf ? 'Capacity Factor (%)' : 'LCOE ($/MWh)' } },
-                        y: { title: { display: true, text: 'Share of Population (%)' } }
+                        y: { title: { display: true, text: 'Population (millions)' } }
                     }
                 }
             });
@@ -2075,10 +2913,10 @@ async function renderAccessCharts(populationData, reliabilityData, cfData, lcoeD
         const comparison = buildSolarVsGridComparison(reliabilityData, cfData);
 
         if (accessComparisonStat) {
-            accessComparisonStat.textContent = `${comparison.pctBetter.toFixed(1)}%`;
+            accessComparisonStat.textContent = `${(comparison.popBetterWithSolar / 1e6).toFixed(1)}M`;
         }
         if (accessComparisonLabel) {
-            accessComparisonLabel.textContent = 'of global population could achieve the same or better reliability with solar';
+            accessComparisonLabel.textContent = 'people could achieve the same or better reliability with solar';
         }
         if (accessChartComparisonTitle) {
             accessChartComparisonTitle.textContent = 'Solar vs Grid Reliability';
@@ -2094,7 +2932,7 @@ async function renderAccessCharts(populationData, reliabilityData, cfData, lcoeD
                 data: {
                     labels: comparison.distributionData.labels,
                     datasets: [{
-                        label: 'Population Share (%)',
+                        label: 'Population (millions)',
                         data: comparison.distributionData.data,
                         backgroundColor: comparison.distributionData.data.map((_, i) => {
                             const bucketMin = -100 + i * 10;
@@ -2110,13 +2948,13 @@ async function renderAccessCharts(populationData, reliabilityData, cfData, lcoeD
                         legend: { display: false },
                         tooltip: {
                             callbacks: {
-                                label: (ctx) => `${ctx.parsed.y.toFixed(1)}% of population`
+                                label: (ctx) => `${ctx.parsed.y.toFixed(2)}M people`
                             }
                         }
                     },
                     scales: {
                         x: { title: { display: true, text: 'Solar CF - Grid Reliability (%)' } },
-                        y: { title: { display: true, text: 'Share of Population (%)' } }
+                        y: { title: { display: true, text: 'Population (millions)' } }
                     }
                 }
             });
@@ -2335,7 +3173,7 @@ function handleHistogramClick(bucket, metrics, overlayMode, baseLayer) {
     }
 }
 
-async function renderPopulationCharts(metrics, { overlayMode, baseLayer, selectedFuels }) {
+async function renderPopulationCharts(metrics, { overlayMode, baseLayer, selectedFuels, potentialState = null, supplyRows = [] }) {
     if (!populationChartHistogram || !populationChartLatMetric || !populationChartLatPop) return;
 
     // Dynamically load Chart.js if not already loaded
@@ -2346,24 +3184,26 @@ async function renderPopulationCharts(metrics, { overlayMode, baseLayer, selecte
 
     const isCf = overlayMode === 'cf';
     const isLcoe = overlayMode === 'lcoe';
-    const fuelSet = selectedFuels instanceof Set ? selectedFuels : (selectedFuels ? new Set(selectedFuels) : new Set(ALL_FUELS));
-    const fuelDescriptor = describeFuelSelection(fuelSet);
-
+    const isPotential = overlayMode === 'potential';
+    const potentialIsMultiple = potentialState?.displayMode === 'multiple';
+    const potentialIsTotal = isPotential && potentialState?.displayMode === 'total';
+    const isStacked = baseLayer === 'plants';
+    const fuelSet = isStacked
+        ? (selectedFuels instanceof Set ? selectedFuels : (selectedFuels ? new Set(selectedFuels) : new Set(ALL_FUELS)))
+        : null;
     // Determine weight descriptor based on baseLayer
-    let weightDescriptor, weightUnit;
+    let weightDescriptor;
     if (baseLayer === 'plants') {
         weightDescriptor = 'Displaceable Plant capacity';
-        weightUnit = 'Capacity (MW)';
     } else if (baseLayer === 'electricity') {
         weightDescriptor = 'electricity demand';
-        weightUnit = 'Electricity Demand (TWh)';
+    } else if (baseLayer === 'access') {
+        weightDescriptor = 'people without access';
+    } else if (baseLayer === 'uptime') {
+        weightDescriptor = `people below ${reliabilityThreshold}% uptime`;
     } else {
         weightDescriptor = 'population';
-        weightUnit = 'Population (people)';
     }
-
-    // Check if we should stack (Plants + Overlay)
-    const isStacked = baseLayer === 'plants' && (isCf || isLcoe);
 
     // Prepare Histogram Data
     let histogramData;
@@ -2372,22 +3212,31 @@ async function renderPopulationCharts(metrics, { overlayMode, baseLayer, selecte
 
     if (isCf) {
         xAxisLabel = 'Capacity Factor (%)';
-        yAxisLabel = weightUnit;
+        yAxisLabel = 'Share (%)';
         scatterXAxisLabel = 'Capacity Factor (%)';
-        histogramMainTitle = 'Distribution by Capacity Factor';
-        histogramHelperText = `Shows total ${weightDescriptor} as a function of Capacity Factor`;
+        histogramMainTitle = 'Demand Distribution by Capacity Factor';
+        histogramHelperText = `Shows share of ${weightDescriptor} across capacity factor bins`;
     } else if (isLcoe) {
         xAxisLabel = 'LCOE solar + battery ($/MWh)';
-        yAxisLabel = weightUnit;
+        yAxisLabel = 'Share (%)';
         scatterXAxisLabel = 'LCOE solar + battery ($/MWh)';
-        histogramMainTitle = 'Distribution by LCOE';
-        histogramHelperText = `Shows total ${weightDescriptor} as a function of LCOE`;
+        histogramMainTitle = 'Demand Distribution by LCOE';
+        histogramHelperText = `Shows share of ${weightDescriptor} across LCOE bins`;
+    } else if (isPotential) {
+        xAxisLabel = potentialIsMultiple ? 'Solar Potential / Demand (×)' : 'Solar Potential (TWh/yr)';
+        yAxisLabel = 'Share (%)';
+        scatterXAxisLabel = xAxisLabel;
+        histogramMainTitle = 'Demand Distribution by Solar Potential';
+        histogramHelperText = `Shows share of ${weightDescriptor} across solar potential bins`;
     } else {
-        xAxisLabel = `Cumulative global ${weightDescriptor} (%)`;
-        yAxisLabel = baseLayer === 'electricity' ? 'Electricity Demand (TWh)' : 'Metric';
-        scatterXAxisLabel = baseLayer === 'electricity' ? 'Electricity Demand (TWh)' : 'Metric';
-        histogramMainTitle = baseLayer === 'electricity' ? 'Electricity Demand Distribution' : 'Metric by percentile';
-        histogramHelperText = `Shows ${baseLayer === 'electricity' ? 'electricity demand' : 'metric'} across ${weightDescriptor} percentiles`;
+        xAxisLabel = 'Supply Metric';
+        yAxisLabel = 'Share (%)';
+        scatterXAxisLabel = 'Supply Metric';
+        histogramMainTitle = 'Demand Distribution';
+        histogramHelperText = `Shows share of ${weightDescriptor} across supply metric bins`;
+    }
+    if (isStacked) {
+        histogramHelperText = `${histogramHelperText} (stacked by fuel)`;
     }
 
     // Update main page heading based on baseLayer
@@ -2395,6 +3244,10 @@ async function renderPopulationCharts(metrics, { overlayMode, baseLayer, selecte
     if (chartsMainHeading) {
         if (baseLayer === 'electricity') {
             chartsMainHeading.textContent = 'Electricity Demand Analysis';
+        } else if (baseLayer === 'access') {
+            chartsMainHeading.textContent = 'Electricity Access Analysis';
+        } else if (baseLayer === 'uptime') {
+            chartsMainHeading.textContent = 'Grid Reliability Analysis';
         } else if (baseLayer === 'plants') {
             chartsMainHeading.textContent = 'Capacity to Displace Analysis';
         } else {
@@ -2404,37 +3257,57 @@ async function renderPopulationCharts(metrics, { overlayMode, baseLayer, selecte
 
     // Update chart title elements
     const chartTitlePercentile = document.getElementById('chart-title-percentile');
-    const chartTitleDistribution = document.getElementById('chart-title-distribution');
     if (chartTitlePercentile) {
+        const metricLabel = isCf
+            ? 'Capacity Factor'
+            : isLcoe
+                ? 'LCOE'
+                : isPotential
+                    ? (potentialIsMultiple ? 'Solar Potential / Demand' : 'Solar Potential')
+                    : 'Supply Metric';
+        chartTitlePercentile.textContent = `Demand Distribution by ${metricLabel}`;
+    }
+
+    if (chartTitleDemandLatitude) {
         if (baseLayer === 'electricity') {
-            chartTitlePercentile.textContent = isCf ? 'Electricity Demand by CF' : isLcoe ? 'Electricity Demand by LCOE' : 'Electricity Demand by Percentile';
+            chartTitleDemandLatitude.textContent = 'Electricity Demand by Latitude';
+        } else if (baseLayer === 'access') {
+            chartTitleDemandLatitude.textContent = 'People Without Access by Latitude';
+        } else if (baseLayer === 'uptime') {
+            chartTitleDemandLatitude.textContent = `People Below ${reliabilityThreshold}% Uptime by Latitude`;
         } else if (baseLayer === 'plants') {
-            chartTitlePercentile.textContent = isCf ? 'Capacity by CF' : isLcoe ? 'Capacity by LCOE' : 'Metric by Capacity Percentile';
+            chartTitleDemandLatitude.textContent = 'Displaceable Capacity by Latitude';
         } else {
-            chartTitlePercentile.textContent = isCf ? 'Population by CF' : isLcoe ? 'Population by LCOE' : 'Metric by Population Percentile';
+            chartTitleDemandLatitude.textContent = 'Population by Latitude';
         }
     }
-    if (chartTitleDistribution) {
-        if (baseLayer === 'electricity') {
-            chartTitleDistribution.textContent = 'Electricity Demand Distribution';
-        } else if (baseLayer === 'plants') {
-            chartTitleDistribution.textContent = 'Capacity Distribution';
-        } else {
-            chartTitleDistribution.textContent = 'Population Distribution';
-        }
+    if (chartTitleSupplyLatitude) {
+        chartTitleSupplyLatitude.textContent = isCf
+            ? 'Capacity Factor by Latitude'
+            : isLcoe
+                ? 'LCOE by Latitude'
+                : isPotential
+                    ? (potentialIsMultiple ? 'Solar Potential / Demand by Latitude' : 'Solar Potential by Latitude')
+                    : 'Supply Metric by Latitude';
     }
 
     let histogramTooltip;
 
     let hist;
     if (isStacked) {
-        // Stacked View
-        // Stacked View
-        hist = buildStackedHistogram(metrics, overlayMode, fuelSet);
-        const rawHist = hist; // Alias for legacy code if needed, or just use hist
+        hist = buildStackedHistogram(metrics, overlayMode, fuelSet, 50, { potentialDisplayMode: potentialState?.displayMode });
+        const totalWeight = hist.datasets.reduce((sum, ds) => {
+            return sum + ds.data.reduce((acc, v) => acc + (Number.isFinite(v) ? v : 0), 0);
+        }, 0);
+
+        if (totalWeight > 0) {
+            hist.datasets.forEach(ds => {
+                ds.data = ds.data.map(v => (Number.isFinite(v) ? (v / totalWeight) * 100 : 0));
+            });
+        }
+
         if (typeof populationChartCumulative !== 'undefined' && populationChartCumulative) {
-            // Apply cumulative sum per dataset
-            rawHist.datasets.forEach(ds => {
+            hist.datasets.forEach(ds => {
                 let sum = 0;
                 ds.data = ds.data.map(v => {
                     sum += v;
@@ -2443,53 +3316,54 @@ async function renderPopulationCharts(metrics, { overlayMode, baseLayer, selecte
             });
         }
 
-        histogramData = rawHist;
+        histogramData = {
+            labels: hist.labels,
+            datasets: hist.datasets
+        };
         histogramTooltip = (ctx) => {
             const val = ctx.parsed.y;
-            const label = ctx.dataset.label;
-            return `${label}: ${val.toFixed(0)} MW`;
+            const label = ctx.dataset.label || 'Value';
+            return `${label}: ${val.toFixed(1)}%`;
         };
     } else {
-        // Single Series (Population or Non-Overlay)
-        // Note: Non-overlay percentiles for plants needs adaptation if metrics are flattened.
-        // buildWeightedHistogram handles flat metrics fine (sorts by metric).
-
-        hist = buildWeightedHistogram(metrics, overlayMode);
-        let chartData = hist.data;
-        if ((isCf || isLcoe) && typeof populationChartCumulative !== 'undefined' && populationChartCumulative) {
+        hist = buildHistogramWithAvailability(metrics, supplyRows, overlayMode, 50, { potentialDisplayMode: potentialState?.displayMode });
+        let demandSeries = hist.demandShare.slice();
+        if (typeof populationChartCumulative !== 'undefined' && populationChartCumulative) {
             let sum = 0;
-            chartData = chartData.map(v => { sum += v; return sum; });
+            demandSeries = demandSeries.map(v => {
+                sum += v;
+                return sum;
+            });
         }
 
-        // Determine dataset label based on baseLayer
-        let datasetLabel;
+        let demandLabel;
         if (baseLayer === 'electricity') {
-            datasetLabel = 'Electricity Demand';
-        } else if (baseLayer === 'plants') {
-            datasetLabel = 'Capacity';
+            demandLabel = 'Electricity demand share';
+        } else if (baseLayer === 'access') {
+            demandLabel = 'No-access share';
+        } else if (baseLayer === 'uptime') {
+            demandLabel = `Below ${reliabilityThreshold}% uptime share`;
         } else {
-            datasetLabel = 'Population';
+            demandLabel = 'Population share';
         }
 
         histogramData = {
             labels: hist.labels,
-            datasets: [{
-                label: datasetLabel,
-                data: chartData,
-                backgroundColor: isCf ? '#fbbf24' : '#10b981',
-                borderColor: isCf ? '#f59e0b' : '#059669',
-                borderWidth: 1
-            }]
+            datasets: [
+                {
+                    type: 'bar',
+                    label: demandLabel,
+                    data: demandSeries,
+                    backgroundColor: '#fbbf24',
+                    borderColor: '#f59e0b',
+                    borderWidth: 1
+                }
+            ]
         };
         histogramTooltip = (ctx) => {
             const val = ctx.parsed.y;
-            if (baseLayer === 'electricity') {
-                return `${ctx.dataset.label}: ${val.toFixed(2)} TWh`;
-            } else if (baseLayer === 'plants') {
-                return `${ctx.dataset.label}: ${val.toLocaleString()} MW`;
-            } else {
-                return `${ctx.dataset.label}: ${val.toLocaleString()}`;
-            }
+            const label = ctx.dataset.label || 'Value';
+            return `${label}: ${val.toFixed(1)}%`;
         };
     }
 
@@ -2510,7 +3384,7 @@ async function renderPopulationCharts(metrics, { overlayMode, baseLayer, selecte
                 responsive: true,
                 maintainAspectRatio: false,
                 plugins: {
-                    legend: { display: isStacked }, // Show legend if stacked
+                    legend: { display: true },
                     tooltip: { callbacks: { label: histogramTooltip } }
                 },
                 onClick: (e, elements) => {
@@ -2530,14 +3404,18 @@ async function renderPopulationCharts(metrics, { overlayMode, baseLayer, selecte
                     },
                     y: {
                         title: { display: true, text: yAxisLabel },
-                        stacked: isStacked
+                        min: 0,
+                        stacked: isStacked,
+                        ticks: {
+                            callback: (value) => `${value}%`
+                        }
                     }
                 }
             }
         });
     } else {
         populationCharts.histogram.data = histogramData;
-        populationCharts.histogram.options.plugins.legend.display = isStacked;
+        populationCharts.histogram.options.plugins.legend.display = true;
         populationCharts.histogram.options.plugins.tooltip.callbacks.label = histogramTooltip;
         populationCharts.histogram.options.onClick = (e, elements) => {
             if (elements && elements.length > 0 && hist.buckets) {
@@ -2549,52 +3427,127 @@ async function renderPopulationCharts(metrics, { overlayMode, baseLayer, selecte
         populationCharts.histogram.options.scales.x.title.text = xAxisLabel;
         populationCharts.histogram.options.scales.x.stacked = isStacked;
         populationCharts.histogram.options.scales.y.title.text = yAxisLabel;
+        populationCharts.histogram.options.scales.y.ticks.callback = (value) => `${value}%`;
         populationCharts.histogram.options.scales.y.stacked = isStacked;
         populationCharts.histogram.update();
     }
 
-    // Latitude Metric Scatter (Bottom-Left)
-    // Flattened metrics usage is fine: multiple dots per location.
+    // Supply by Latitude (Bottom-Left)
     const normalizeMetric = (val) => {
         if (!Number.isFinite(val)) return val;
         if (isCf) return val * 100;
         return val;
     };
-    const metricScatterData = metrics.map(m => ({ x: normalizeMetric(m.metric), y: m.latitude }));
+    const supplyScatterRows = supplyRows
+        .map(m => ({
+            latitude: m.latitude,
+            metric: normalizeMetric(m.metric)
+        }))
+        .filter(m => Number.isFinite(m.latitude) && Number.isFinite(m.metric));
+    const metricScatterData = supplyScatterRows.map(m => ({ x: m.metric, y: m.latitude }));
 
     // Update labels for bottom-left
-    if (populationChartLatMetricTitle) populationChartLatMetricTitle.textContent = `${overlayMode === 'cf' ? 'CF' : 'LCOE'} by latitude`;
+    if (populationChartLatMetricTitle) {
+        populationChartLatMetricTitle.textContent = isCf
+            ? 'CF by latitude'
+            : isLcoe
+                ? 'LCOE by latitude'
+                : isPotential
+                    ? (potentialIsMultiple ? 'Solar potential / demand by latitude' : 'Solar potential by latitude')
+                    : 'Supply metric by latitude';
+    }
 
-    if (!populationCharts.latMetric) {
-        populationCharts.latMetric = new ChartJS(populationChartLatMetric.getContext('2d'), {
-            type: 'scatter',
-            data: {
-                datasets: [{
-                    label: scatterXAxisLabel,
-                    data: metricScatterData,
-                    backgroundColor: 'rgba(52, 211, 153, 0.6)',
-                    pointRadius: 2
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                plugins: { legend: { display: false } },
-                scales: {
-                    x: { title: { display: true, text: scatterXAxisLabel } },
-                    y: { title: { display: true, text: 'Latitude' }, min: -90, max: 90 }
+    const supplyChartIsBinned = potentialIsTotal;
+    if (supplyChartIsBinned) {
+        const supplyLatHistogram = buildLatitudeSupplyHistogram(supplyRows);
+        if (!populationCharts.latMetric || populationCharts.latMetric.config.type !== 'bar') {
+            destroyChart(populationCharts.latMetric);
+            populationCharts.latMetric = new ChartJS(populationChartLatMetric.getContext('2d'), {
+                type: 'bar',
+                data: {
+                    labels: supplyLatHistogram.labels,
+                    datasets: [{
+                        label: 'Supply share (%)',
+                        data: supplyLatHistogram.data,
+                        backgroundColor: '#38bdf8',
+                        borderColor: '#0ea5e9',
+                        borderWidth: 1
+                    }]
+                },
+                options: {
+                    indexAxis: 'y',
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        x: { title: { display: true, text: 'Supply share (%)' } },
+                        y: { title: { display: true, text: 'Latitude band' } }
+                    }
                 }
-            }
-        });
+            });
+        } else {
+            populationCharts.latMetric.data.labels = supplyLatHistogram.labels;
+            populationCharts.latMetric.data.datasets[0].data = supplyLatHistogram.data;
+            populationCharts.latMetric.update();
+        }
     } else {
-        populationCharts.latMetric.data.datasets[0].data = metricScatterData;
-        populationCharts.latMetric.options.scales.x.title.text = scatterXAxisLabel;
-        populationCharts.latMetric.update();
+        const stats = computeLatBandStats(supplyScatterRows);
+        const medianData = stats.map(s => ({ x: s.p50, y: s.lat }));
+
+        const datasets = [
+            {
+                type: 'line',
+                label: 'Median',
+                data: medianData,
+                borderColor: '#38bdf8',
+                borderWidth: 2,
+                pointRadius: 0,
+                tension: 0.3,
+                spanGaps: true
+            },
+            {
+                type: 'scatter',
+                label: scatterXAxisLabel,
+                data: metricScatterData,
+                backgroundColor: 'rgba(52, 211, 153, 0.4)',
+                pointRadius: 2
+            }
+        ];
+
+        if (!populationCharts.latMetric || populationCharts.latMetric.config.type !== 'scatter') {
+            destroyChart(populationCharts.latMetric);
+            populationCharts.latMetric = new ChartJS(populationChartLatMetric.getContext('2d'), {
+                type: 'scatter',
+                data: { datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        x: { title: { display: true, text: scatterXAxisLabel } },
+                        y: { title: { display: true, text: 'Latitude' }, min: -90, max: 90 }
+                    }
+                }
+            });
+        } else {
+            populationCharts.latMetric.data.datasets = datasets;
+            populationCharts.latMetric.options.scales.x.title.text = scatterXAxisLabel;
+            populationCharts.latMetric.update();
+        }
     }
 
     // Latitude Population/Capacity Histogram (Bottom-Right)
     const popHistogram = buildWeightedLatitudeHistogram(metrics);
-    const latPopLabel = `${weightDescriptor === 'population' ? 'Population' : 'Capacity'} share (%)`;
+    const latPopLabel = baseLayer === 'electricity'
+        ? 'Electricity demand share (%)'
+        : baseLayer === 'plants'
+            ? 'Capacity share (%)'
+            : baseLayer === 'access'
+                ? 'No-access share (%)'
+                : baseLayer === 'uptime'
+                    ? `Below ${reliabilityThreshold}% uptime share (%)`
+                    : 'Population share (%)';
+    const latPopAxisLabel = latPopLabel;
 
     if (populationChartLatPopLabel) populationChartLatPopLabel.textContent = `${weightDescriptor} by latitude`;
 
@@ -2617,7 +3570,7 @@ async function renderPopulationCharts(metrics, { overlayMode, baseLayer, selecte
                 maintainAspectRatio: false,
                 plugins: { legend: { display: false } },
                 scales: {
-                    x: { title: { display: true, text: 'Share (%)' } },
+                    x: { title: { display: true, text: latPopAxisLabel } },
                     y: { title: { display: true, text: 'Latitude band' } }
                 }
             }
@@ -2626,12 +3579,14 @@ async function renderPopulationCharts(metrics, { overlayMode, baseLayer, selecte
         populationCharts.latPop.data.labels = popHistogram.labels;
         populationCharts.latPop.data.datasets[0].label = latPopLabel;
         populationCharts.latPop.data.datasets[0].data = popHistogram.data;
+        populationCharts.latPop.options.scales.x.title.text = latPopAxisLabel;
         populationCharts.latPop.update();
     }
 }
 
 function prepareLcoeDisplayData() {
     if (!summaryData.length || locationIndex.size === 0) return;
+    const perf = startPerf('lcoe-prepare', { mode: lcoeDisplayMode, targetCf: lcoeParams.targetCf });
     lcoeResults = computeBestLcoeByLocation(lcoeParams.targetCf, lcoeParams);
 
     // Sync reference to freshest data
@@ -2695,11 +3650,13 @@ function prepareLcoeDisplayData() {
         }
     }
     lastColorInfo = colorInfo;
+    endPerf(perf, { resultRows: resultsWithDelta.length });
 
     return { resultsWithDelta, ref, colorInfo };
 }
 
 function updateLcoeView() {
+    if (currentViewMode !== 'lcoe') return;
     if (lcoeTargetMode === 'utilization') {
         // Existing mode: Show LCOE to achieve target CF
         const prepared = prepareLcoeDisplayData();
@@ -2714,6 +3671,7 @@ function updateLcoeView() {
     } else {
         // New mode: Show CF heatmap at target LCOE
         if (!summaryData.length || locationIndex.size === 0) return;
+        const perf = startPerf('lcoe-cf-at-target', { targetLcoe: targetLcoeValue });
 
         // Calculate which config achieves closest to target LCOE for each location
         const cfResults = computeCfAtTargetLcoe(targetLcoeValue, lcoeParams);
@@ -2733,16 +3691,25 @@ function updateLcoeView() {
             colorInfo,
             reference: ref
         });
+        endPerf(perf, { resultRows: resultsWithDelta.length });
     }
 }
 
-function updatePopulationView() {
-    const overlayMode = populationOverlayMode || 'none';
+async function updatePopulationView() {
+    if (currentViewMode !== 'population') return;
+    let overlayMode = populationOverlayMode || 'cf';
+    if (overlayMode === 'none') {
+        overlayMode = 'cf';
+        populationOverlayMode = 'cf';
+        updatePopulationOverlayToggleUI();
+        updatePopulationOverlayControls('cf');
+    }
 
     // Prepare data for overlay
     let cfData = [];
     let lcoeData = [];
     let lcoeColorInfo = null;
+    let potentialState = null;
 
     if (overlayMode === 'cf') {
         cfData = getSummaryForConfig(currentSolar, currentBatt);
@@ -2752,6 +3719,10 @@ function updatePopulationView() {
             lcoeData = prepared.resultsWithDelta;
             lcoeColorInfo = prepared.colorInfo;
         }
+    } else if (overlayMode === 'potential') {
+        potentialState = await getPotentialOverlayState();
+        if (!potentialState) return;
+        syncPotentialToggleUI();
     }
 
     // Display mode: map or charts
@@ -2760,48 +3731,40 @@ function updatePopulationView() {
         showPopulationChartsOnly();
         setLocationPanelChartSummary();
 
-        // Toggle chart containers based on baseLayer
-        if (populationBaseLayer === 'access') {
-            // Show access-specific charts, hide standard charts
-            if (standardChartsContainer) standardChartsContainer.classList.add('hidden');
-            if (accessChartsContainer) accessChartsContainer.classList.remove('hidden');
+        // Show standard charts, hide access charts
+        if (standardChartsContainer) standardChartsContainer.classList.remove('hidden');
+        if (accessChartsContainer) accessChartsContainer.classList.add('hidden');
 
-            // Render access-specific charts
-            renderAccessCharts(populationData, reliabilityData, cfData, lcoeData, overlayMode);
-
-            // Update main heading
-            const chartsMainHeading = document.getElementById('charts-main-heading');
-            if (chartsMainHeading) {
-                chartsMainHeading.textContent = 'Energy Access Analysis';
-            }
-        } else {
-            // Show standard charts, hide access charts
-            if (standardChartsContainer) standardChartsContainer.classList.remove('hidden');
-            if (accessChartsContainer) accessChartsContainer.classList.add('hidden');
-
-            // Build metrics for standard charts
-            let metrics = [];
-            if (populationBaseLayer === 'population') {
-                metrics = buildPopulationMetrics(populationData, overlayMode, cfData, lcoeData);
-            } else if (populationBaseLayer === 'plants') {
-                metrics = buildPlantMetrics(fossilCapacity, overlayMode, cfData, lcoeData, populationFuelFilter, plantStatusFilter);
-            } else if (populationBaseLayer === 'electricity') {
-                metrics = buildElectricityMetrics(electricityDemandData, overlayMode, cfData, lcoeData);
-            }
-
-            renderPopulationCharts(metrics, {
-                overlayMode,
-                baseLayer: populationBaseLayer,
-                selectedFuels: populationFuelFilter
-            });
+        // Build metrics for charts
+        let metrics = [];
+        if (populationBaseLayer === 'population') {
+            metrics = buildPopulationMetrics(populationData, overlayMode, cfData, lcoeData, potentialState);
+        } else if (populationBaseLayer === 'plants') {
+            metrics = buildPlantMetrics(fossilCapacity, overlayMode, cfData, lcoeData, populationFuelFilter, plantStatusFilter, potentialState);
+        } else if (populationBaseLayer === 'electricity') {
+            metrics = buildElectricityMetrics(electricityDemandData, overlayMode, cfData, lcoeData, potentialState);
+        } else if (populationBaseLayer === 'access') {
+            metrics = buildReliabilityMetrics(reliabilityData, overlayMode, cfData, lcoeData, potentialState, 'access');
+        } else if (populationBaseLayer === 'uptime') {
+            metrics = buildReliabilityMetrics(reliabilityData, overlayMode, cfData, lcoeData, potentialState, 'uptime');
         }
+
+        const supplyRows = buildSupplyMetricRows(overlayMode, cfData, lcoeData, potentialState);
+
+        renderPopulationCharts(metrics, {
+            overlayMode,
+            baseLayer: populationBaseLayer,
+            selectedFuels: populationFuelFilter,
+            potentialState,
+            supplyRows
+        });
     } else {
         // Show map
         showMapContainerOnly();
 
         updatePopulationSimple(populationData, {
             baseLayer: populationBaseLayer,
-            overlayMode: populationOverlayMode,
+            overlayMode: 'none',
             cfData: cfData,
             lcoeData: lcoeData,
             lcoeColorInfo: lcoeColorInfo,
@@ -2816,7 +3779,15 @@ function updatePopulationView() {
             selectedStatus: plantStatusFilter
         });
 
-        updatePopulationLegend(populationData, overlayMode, populationBaseLayer);
+        updatePopulationLegend(populationData, 'none', populationBaseLayer);
+        updateSupplyMap({
+            overlayMode: populationOverlayMode,
+            cfData,
+            lcoeData,
+            lcoeColorInfo,
+            potentialState
+        });
+        updateSupplyLegend(populationOverlayMode, lcoeColorInfo, potentialState);
     }
 }
 
@@ -2883,7 +3854,9 @@ async function init() {
         // Load ONLY essential data upfront - summary data is required for the initial view
         // Population, fossil plants, and electricity data are lazy-loaded when their views are accessed
         loadingStatus.textContent = "Downloading summary data...";
+        const summaryLoadPerf = startPerf('summary-load');
         summaryData = await loadSummary();
+        endPerf(summaryLoadPerf, { rows: summaryData?.length || 0 });
         console.log("summaryData loaded:", typeof summaryData, Array.isArray(summaryData), summaryData ? summaryData.length : 'null');
         if (!Array.isArray(summaryData)) {
             throw new Error("summaryData is not an array! It is: " + typeof summaryData);
@@ -2891,6 +3864,10 @@ async function init() {
         prepareSummaryIndexes(summaryData);
         locationIndex = buildLocationIndex(summaryData);
         summaryCoordIndex = buildCoordIndex(summaryData);
+
+        if (FEATURE_WORKER_LCOE) {
+            ensureLcoeWorkerReady();
+        }
 
         // NOTE: Population, fossil plants, and electricity data are now LAZY LOADED
         // They will be fetched when the user switches to the Supply-Demand Matching view
@@ -2933,9 +3910,11 @@ function initUIEvents() {
                 const level = btn.dataset.level;
                 if (!level || level === potentialLevel) return;
                 potentialLevel = level;
-                updateToggleUI(potentialLevelButtons, potentialLevel, 'level');
+                syncPotentialToggleUI();
                 if (currentViewMode === 'potential') {
                     updatePotentialView();
+                } else if (currentViewMode === 'population' && populationOverlayMode === 'potential') {
+                    updatePopulationView();
                 }
             });
         });
@@ -2946,9 +3925,43 @@ function initUIEvents() {
                 const mode = btn.dataset.display;
                 if (!mode || mode === potentialDisplayMode) return;
                 potentialDisplayMode = mode;
-                updateToggleUI(potentialDisplayButtons, potentialDisplayMode, 'display');
+                syncPotentialToggleUI();
                 if (currentViewMode === 'potential') {
                     updatePotentialView();
+                } else if (currentViewMode === 'population' && populationOverlayMode === 'potential') {
+                    updatePopulationView();
+                }
+            });
+        });
+    }
+
+    if (supplyPotentialLevelButtons && supplyPotentialLevelButtons.length) {
+        supplyPotentialLevelButtons.forEach(btn => {
+            btn.addEventListener('click', () => {
+                const level = btn.dataset.level;
+                if (!level || level === potentialLevel) return;
+                potentialLevel = level;
+                syncPotentialToggleUI();
+                if (currentViewMode === 'potential') {
+                    updatePotentialView();
+                } else if (currentViewMode === 'population' && populationOverlayMode === 'potential') {
+                    updatePopulationView();
+                }
+            });
+        });
+    }
+
+    if (supplyPotentialDisplayButtons && supplyPotentialDisplayButtons.length) {
+        supplyPotentialDisplayButtons.forEach(btn => {
+            btn.addEventListener('click', () => {
+                const mode = btn.dataset.display;
+                if (!mode || mode === potentialDisplayMode) return;
+                potentialDisplayMode = mode;
+                syncPotentialToggleUI();
+                if (currentViewMode === 'potential') {
+                    updatePotentialView();
+                } else if (currentViewMode === 'population' && populationOverlayMode === 'potential') {
+                    updatePopulationView();
                 }
             });
         });
@@ -2984,6 +3997,18 @@ function initUIEvents() {
         });
     });
 
+    if (populationControlsToggle && populationControls) {
+        populationControlsToggle.addEventListener('click', () => {
+            togglePanelCollapse(populationControls, populationControlsToggle);
+        });
+    }
+
+    if (populationSupplyToggle && populationSupplyPanel) {
+        populationSupplyToggle.addEventListener('click', () => {
+            togglePanelCollapse(populationSupplyPanel, populationSupplyToggle);
+        });
+    }
+
     // Plant Status Toggle (Announced/Existing)
     plantStatusButtons.forEach(btn => {
         btn.addEventListener('click', () => {
@@ -2999,7 +4024,7 @@ function initUIEvents() {
 
     populationOverlayButtons.forEach(btn => {
         btn.addEventListener('click', () => {
-            const mode = btn.dataset.overlay || 'none';
+            const mode = btn.dataset.overlay || 'cf';
             if (mode === populationOverlayMode) return;
             populationOverlayMode = mode;
             updatePopulationOverlayToggleUI();
@@ -3008,6 +4033,12 @@ function initUIEvents() {
                 updatePopulationView();
             }
         });
+    });
+
+    window.addEventListener('resize', () => {
+        if (currentViewMode === 'population' && populationDisplayMode === 'charts') {
+            updatePopulationChartsBounds();
+        }
     });
 
 
@@ -3042,6 +4073,10 @@ function initUIEvents() {
     // Cumulative Toggle
     const cumulativeToggle = document.getElementById('chart-cumulative-toggle');
     if (cumulativeToggle) {
+        cumulativeToggle.textContent = `Cumulative: ${populationChartCumulative ? 'ON' : 'OFF'}`;
+        cumulativeToggle.classList.toggle('text-emerald-400', populationChartCumulative);
+        cumulativeToggle.classList.toggle('bg-emerald-400/10', populationChartCumulative);
+        cumulativeToggle.classList.toggle('border-emerald-400/20', populationChartCumulative);
         cumulativeToggle.addEventListener('click', () => {
             populationChartCumulative = !populationChartCumulative;
             cumulativeToggle.textContent = `Cumulative: ${populationChartCumulative ? 'ON' : 'OFF'}`;
@@ -3051,6 +4086,18 @@ function initUIEvents() {
 
             // Re-render chart
             updatePopulationView();
+        });
+    }
+
+    if (reliabilityThresholdSlider) {
+        reliabilityThresholdSlider.addEventListener('input', (e) => {
+            const val = parseInt(e.target.value, 10);
+            if (!Number.isFinite(val)) return;
+            reliabilityThreshold = Math.max(0, Math.min(100, val));
+            if (reliabilityThresholdVal) reliabilityThresholdVal.textContent = reliabilityThreshold;
+            if (currentViewMode === 'population' && populationBaseLayer === 'uptime') {
+                updatePopulationView();
+            }
         });
     }
 
@@ -3279,6 +4326,11 @@ async function updateViewMode(mode) {
         resetLcoeTimeLegendLock();
     }
 
+    setDualMapMode(mode === 'population' && populationDisplayMode === 'map');
+    if (mode !== 'population') {
+        updateSupplyMap({ overlayMode: 'none' });
+    }
+
     // Update Tabs UI
     viewTabs.forEach(tab => {
         const isActive = tab.dataset.mode === mode;
@@ -3295,12 +4347,13 @@ async function updateViewMode(mode) {
     cleanupSampleDays();
     if (mode !== 'population') {
         populationChartsContainer.classList.add('hidden');
-        mapContainer.classList.remove('hidden');
+        if (mapShell) mapShell.classList.remove('hidden');
     }
 
     // Toggle Panels
     const systemConfig = document.getElementById('primary-controls');
     const lcoeControls = document.getElementById('lcoe-controls');
+    const populationSupplyPanel = populationSupplyControls;
 
     if (mode === 'lcoe') {
         // LCOE mode: Hide system config, show LCOE controls
@@ -3310,6 +4363,7 @@ async function updateViewMode(mode) {
         sampleControls.classList.add('hidden');
         if (potentialControls) potentialControls.classList.add('hidden');
         populationControls.classList.add('hidden');
+        if (populationSupplyPanel) populationSupplyPanel.classList.add('hidden');
     } else if (mode === 'samples') {
         // Samples mode: Show system config + sample controls
         if (systemConfig) systemConfig.classList.remove('hidden');
@@ -3318,6 +4372,7 @@ async function updateViewMode(mode) {
         sampleControls.classList.remove('hidden');
         if (potentialControls) potentialControls.classList.add('hidden');
         populationControls.classList.add('hidden');
+        if (populationSupplyPanel) populationSupplyPanel.classList.add('hidden');
     } else if (mode === 'potential') {
         // Potential mode: Hide system config, show potential controls
         if (systemConfig) systemConfig.classList.add('hidden');
@@ -3326,6 +4381,7 @@ async function updateViewMode(mode) {
         sampleControls.classList.add('hidden');
         if (potentialControls) potentialControls.classList.remove('hidden');
         populationControls.classList.add('hidden');
+        if (populationSupplyPanel) populationSupplyPanel.classList.add('hidden');
     } else if (mode === 'population') {
         // Population mode: Hide system config, show population controls
         if (systemConfig) systemConfig.classList.add('hidden');
@@ -3334,6 +4390,11 @@ async function updateViewMode(mode) {
         sampleControls.classList.add('hidden');
         if (potentialControls) potentialControls.classList.add('hidden');
         populationControls.classList.remove('hidden');
+        if (populationSupplyPanel) populationSupplyPanel.classList.remove('hidden');
+        updatePopulationOverlayToggleUI();
+        updatePopulationOverlayControls(populationOverlayMode);
+        syncPotentialToggleUI();
+        if (populationViewToggle) populationViewToggle.classList.remove('hidden');
     } else {
         // Capacity mode: Show system config only
         if (systemConfig) systemConfig.classList.remove('hidden');
@@ -3342,6 +4403,8 @@ async function updateViewMode(mode) {
         sampleControls.classList.add('hidden');
         if (potentialControls) potentialControls.classList.add('hidden');
         populationControls.classList.add('hidden');
+        if (populationSupplyPanel) populationSupplyPanel.classList.add('hidden');
+        if (populationViewToggle) populationViewToggle.classList.add('hidden');
     }
 
     // Toggle Legends & Map Content
@@ -3366,6 +4429,7 @@ async function updateViewMode(mode) {
     } else if (mode === 'population') {
         // LAZY LOAD: Ensure population data is loaded before updating view
         await ensurePopulationModeDataLoaded();
+        if (currentViewMode !== mode) return;
         updatePopulationView();
     }
 }
@@ -3414,9 +4478,9 @@ function updateSampleView() {
     }
 }
 
-async function updatePotentialView() {
+async function getPotentialOverlayState() {
     const loaded = await ensurePotentialDataLoaded();
-    if (!loaded) return;
+    if (!loaded) return null;
 
     const key = potentialLevel === 'level2' ? 'pvout_level2_twh_y' : 'pvout_level1_twh_y';
     const dataAreaKey = potentialLevel === 'level2'
@@ -3428,7 +4492,7 @@ async function updatePotentialView() {
 
     if (isMultiple) {
         const demandLoaded = await ensureElectricityDataLoaded();
-        if (!demandLoaded) return;
+        if (!demandLoaded) return null;
         demandMap = electricityDemandMap;
     }
 
@@ -3449,36 +4513,63 @@ async function updatePotentialView() {
     }
 
     const values = [];
-    const ratioValues = [];
-
     potentialData.forEach(row => {
         const lat = Number(row.latitude);
         if (latBounds && (lat < latBounds.min || lat > latBounds.max)) return;
         const total = Number(row[key] || 0);
         if (!Number.isFinite(total)) return;
         values.push(total);
-        if (isMultiple && demandMap) {
-            const demandRow = demandMap.get(row.location_id);
-            const demandKwh = demandRow ? Number(demandRow.annual_demand_kwh || 0) : 0;
-            const demandTwh = demandKwh > 0 ? demandKwh / 1e9 : 0;
-            if (demandTwh > 0) {
-                ratioValues.push(total / demandTwh);
-            }
-        }
     });
 
     if (!values.length) {
-        if (legendPotentialMin) legendPotentialMin.textContent = '--';
-        if (legendPotentialMax) legendPotentialMax.textContent = '--';
-        updatePotentialMap([], { level: potentialLevel });
-        return;
+        return {
+            data: [],
+            level: potentialLevel,
+            displayMode: potentialDisplayMode,
+            isMultiple,
+            min: null,
+            max: null,
+            demandMap,
+            latBounds,
+            key,
+            valueCount: 0
+        };
     }
 
     let minVal = Math.min(...values);
     let maxVal = Math.max(...values);
-
     if (!isMultiple && minVal === maxVal) {
         maxVal = minVal + 1;
+    }
+
+    return {
+        data: potentialData,
+        level: potentialLevel,
+        displayMode: potentialDisplayMode,
+        isMultiple,
+        min: minVal,
+        max: maxVal,
+        demandMap,
+        latBounds,
+        key,
+        valueCount: values.length
+    };
+}
+
+async function updatePotentialView() {
+    if (currentViewMode !== 'potential') return;
+    const state = await getPotentialOverlayState();
+    if (!state) return;
+    if (currentViewMode !== 'potential') return;
+
+    const { data, isMultiple, min, max, demandMap, latBounds, level, displayMode, valueCount } = state;
+    syncPotentialToggleUI();
+
+    if (!valueCount) {
+        if (legendPotentialMin) legendPotentialMin.textContent = '--';
+        if (legendPotentialMax) legendPotentialMax.textContent = '--';
+        updatePotentialMap([], { level: potentialLevel });
+        return;
     }
 
     if (legendPotentialTitle) {
@@ -3501,19 +4592,19 @@ async function updatePotentialView() {
     }
 
     if (legendPotentialMin) {
-        legendPotentialMin.textContent = isMultiple ? '' : formatNumber(minVal, 2);
+        legendPotentialMin.textContent = isMultiple ? '' : formatNumber(min, 2);
         legendPotentialMin.classList.toggle('hidden', isMultiple);
     }
     if (legendPotentialMax) {
-        legendPotentialMax.textContent = isMultiple ? '' : formatNumber(maxVal, 2);
+        legendPotentialMax.textContent = isMultiple ? '' : formatNumber(max, 2);
         legendPotentialMax.classList.toggle('hidden', isMultiple);
     }
 
-    updatePotentialMap(potentialData, {
-        level: potentialLevel,
-        min: minVal,
-        max: maxVal,
-        displayMode: potentialDisplayMode,
+    updatePotentialMap(data, {
+        level,
+        min,
+        max,
+        displayMode,
         demandMap,
         latBounds
     });
@@ -3565,7 +4656,7 @@ function updateModel() {
 // Start
 init();
 
-function buildElectricityMetrics(demandData, overlayMode, cfData, lcoeData) {
+function buildElectricityMetrics(demandData, overlayMode, cfData, lcoeData, potentialState = null) {
     // Similar to population metrics but uses demandData (annual_demand_kwh) as weight
     const metrics = [];
 
@@ -3575,6 +4666,8 @@ function buildElectricityMetrics(demandData, overlayMode, cfData, lcoeData) {
     if (cfData) cfData.forEach(d => cfByCoord.set(roundedKey(d.latitude, d.longitude), d));
     const lcoeByCoord = new Map();
     if (lcoeData) lcoeData.forEach(d => lcoeByCoord.set(roundedKey(d.latitude, d.longitude), d));
+    const potentialById = potentialState?.data ? new Map(potentialState.data.map(d => [d.location_id, d])) : null;
+    const potentialByCoord = potentialState?.data ? new Map(potentialState.data.map(d => [roundedKey(d.latitude, d.longitude), d])) : null;
 
     demandData.forEach(d => {
         if (!d.annual_demand_kwh || d.annual_demand_kwh <= 0) return;
@@ -3582,6 +4675,7 @@ function buildElectricityMetrics(demandData, overlayMode, cfData, lcoeData) {
         const key = roundedKey(d.latitude, d.longitude);
         const cfRow = cfByCoord.get(key);
         const lcoeRow = lcoeByCoord.get(key);
+        const potentialRow = potentialById?.get(d.location_id) || potentialByCoord?.get(key);
 
         let metricVal = null;
         let meetsTarget = false;
@@ -3590,10 +4684,11 @@ function buildElectricityMetrics(demandData, overlayMode, cfData, lcoeData) {
             metricVal = cfRow.annual_cf;
             meetsTarget = true;
         } else if (overlayMode === 'lcoe' && lcoeRow) {
-            if (lcoeRow.meetsTarget) {
-                metricVal = lcoeRow.lcoe;
-                meetsTarget = true;
-            }
+            metricVal = lcoeRow.lcoe;
+            meetsTarget = true;
+        } else if (overlayMode === 'potential') {
+            metricVal = getPotentialMetricFromRow(potentialRow, potentialState);
+            meetsTarget = Number.isFinite(metricVal);
         } else if (overlayMode === 'none') {
             // When no overlay, use demand itself as the "metric" for charting distribution
             // Convert to TWh for display consistency
@@ -3617,15 +4712,25 @@ function buildElectricityMetrics(demandData, overlayMode, cfData, lcoeData) {
     return metrics;
 }
 
+function applyAccessMetric(metric) {
+    accessMetric = metric;
+    setAccessMetric(metric);
+}
+
 // Access Toggle Logic
 document.addEventListener('DOMContentLoaded', () => {
     const btnRel = document.getElementById('btn-access-rel');
     const btnNone = document.getElementById('btn-access-none');
     const legendBar = document.getElementById('legend-access-bar');
+    const legendTitle = document.getElementById('legend-access-title');
+    const legendMin = document.getElementById('legend-access-min');
+    const legendMid = document.getElementById('legend-access-mid');
+    const legendMax = document.getElementById('legend-access-max');
+    const legendNote = document.getElementById('legend-access-note');
 
     if (btnRel && btnNone) {
         btnRel.addEventListener('click', () => {
-            setAccessMetric('reliability');
+            applyAccessMetric('reliability');
 
             // Update UI
             btnRel.classList.remove('text-slate-400', 'hover:text-white', 'bg-transparent');
@@ -3634,10 +4739,15 @@ document.addEventListener('DOMContentLoaded', () => {
             btnNone.classList.add('text-slate-400', 'hover:text-white', 'bg-transparent');
             btnNone.classList.remove('bg-slate-600', 'text-white', 'shadow-sm');
 
-            // Update Gradient (Red -> Green)
+            // Update Gradient (Red -> Grey)
             if (legendBar) {
-                legendBar.style.background = 'linear-gradient(to right, #ef4444, #eab308, #22c55e)';
+                legendBar.style.background = 'linear-gradient(to right, #ef4444, #6b7280)';
             }
+            if (legendTitle) legendTitle.textContent = 'Grid Reliability';
+            if (legendMin) legendMin.textContent = '0%';
+            if (legendMid) legendMid.textContent = '';
+            if (legendMax) legendMax.textContent = '100%';
+            if (legendNote) legendNote.textContent = 'No Data (HREA not covered)';
 
             // Force update
             if (currentViewMode === 'population') {
@@ -3646,7 +4756,7 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         btnNone.addEventListener('click', () => {
-            setAccessMetric('no_access');
+            applyAccessMetric('no_access_pop');
 
             // Update UI
             btnNone.classList.remove('text-slate-400', 'hover:text-white', 'bg-transparent');
@@ -3655,10 +4765,15 @@ document.addEventListener('DOMContentLoaded', () => {
             btnRel.classList.add('text-slate-400', 'hover:text-white', 'bg-transparent');
             btnRel.classList.remove('bg-slate-600', 'text-white', 'shadow-sm');
 
-            // Update Gradient (Green -> Red)
+            // Update Gradient (Dark Grey -> Red)
             if (legendBar) {
-                legendBar.style.background = 'linear-gradient(to right, #22c55e, #eab308, #ef4444)';
+                legendBar.style.background = 'linear-gradient(to right, #1e293b, #991b1b, #ff0000)';
             }
+            if (legendTitle) legendTitle.textContent = 'Population Without Access';
+            if (legendMin) legendMin.textContent = 'Low';
+            if (legendMid) legendMid.textContent = '';
+            if (legendMax) legendMax.textContent = 'High';
+            if (legendNote) legendNote.textContent = 'Dark grey: universal access';
 
             // Force update
             if (currentViewMode === 'population') {

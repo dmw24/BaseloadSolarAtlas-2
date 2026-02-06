@@ -164,6 +164,7 @@ function materializeSampleRows(arrowTable) {
 // Cache for loaded sample data - avoids reloading when switching back to previous values
 const sampleCache = new Map();
 const CACHE_SIZE = 4; // Keep last 4 solar/battery combinations
+const weeklyFrameCache = new Map();
 
 export async function loadSampleColumnar(solarGw, battGwh) {
     const cacheKey = `${solarGw}_${battGwh}`;
@@ -197,6 +198,44 @@ export async function loadSample(solarGw, battGwh) {
     });
 
     return rows;
+}
+
+export async function loadWeeklyFrameCache(configId, season) {
+    const seasonKey = (season || 'summer').toString().toLowerCase();
+    const cacheKey = `${configId}_${seasonKey}`;
+    if (weeklyFrameCache.has(cacheKey)) {
+        return weeklyFrameCache.get(cacheKey);
+    }
+
+    const wasm = await initWasm();
+    const { tableFromIPC } = await import('./apache-arrow.js');
+
+    const candidates = [
+        `framecache_${configId}_${seasonKey}.parquet`,
+        `${configId}_${seasonKey}.parquet`
+    ];
+
+    for (const filename of candidates) {
+        const response = await fetch(`../deployment/data/samples_light/${filename}`);
+        if (!response.ok) continue;
+
+        const buffer = await response.arrayBuffer();
+        const wasmTable = (wasm.readParquet || readParquet)(new Uint8Array(buffer));
+        const table = wasmTable.intoIPCStream();
+        const arrowTable = tableFromIPC(table);
+        const rows = [];
+        for (const row of arrowTable) {
+            const json = row.toJSON();
+            rows.push({
+                ...json,
+                season: typeof json.season === 'string' ? json.season.toLowerCase() : seasonKey
+            });
+        }
+        weeklyFrameCache.set(cacheKey, rows);
+        return rows;
+    }
+
+    throw new Error(`Weekly frame cache not found for config=${configId}, season=${seasonKey}`);
 }
 
 export async function loadElectricityDemandData() {

@@ -57,7 +57,10 @@
     class="bg-black text-on-surface font-sans h-screen w-screen overflow-hidden relative selection:bg-primary selection:text-black">
 
     <!-- Map Layer (Full Screen) -->
-    <div id="map" class="absolute inset-0 z-0 bg-[#0a0a0a]"></div>
+    <div id="map-shell" class="absolute inset-0 z-0">
+        <div id="map" class="map-pane bg-[#0a0a0a]"></div>
+        <div id="map-supply" class="map-pane bg-[#0a0a0a]"></div>
+    </div>
 
     <!-- Top Bar (Floating) -->
     <header class="absolute top-4 left-4 right-4 z-40 flex items-center justify-between pointer-events-none">
@@ -107,7 +110,7 @@
     </header>
 
     <!-- Main Floating Panel (Left) -->
-    <div class="absolute top-20 left-4 z-20 w-80 flex flex-col gap-3 pointer-events-none">
+    <div class="absolute top-20 left-4 z-30 w-80 flex flex-col gap-3 pointer-events-none">
 
         <!-- Primary Controls Card -->
         <div id="primary-controls"
@@ -341,18 +344,31 @@
 
         <!-- Population Controls (Only visible in Population mode) -->
         <div id="population-controls"
-            class="hidden pointer-events-auto bg-surface/90 backdrop-blur-md border border-white/10 rounded-2xl shadow-xl p-5 space-y-4 max-h-[80vh] overflow-y-auto">
-            <!-- Population specific controls here - simplified for now -->
-            <div class="space-y-3">
-                <label class="text-xs font-medium text-gray-400 uppercase tracking-wider">Demand Layer</label>
+            class="hidden pointer-events-auto bg-surface/90 backdrop-blur-md border border-white/10 rounded-2xl shadow-xl p-5 max-h-[80vh] overflow-y-auto panel-collapsible">
+            <div class="panel-header flex items-center justify-between mb-2">
+                <h2 class="panel-title text-sm font-medium text-gray-400 uppercase tracking-wider">Demand</h2>
+                <button id="population-controls-toggle"
+                    class="panel-collapse-btn text-gray-500 hover:text-white transition-colors"
+                    title="Collapse panel" aria-expanded="true">
+                    <span class="material-symbols-outlined text-[20px]">chevron_left</span>
+                </button>
+            </div>
+
+            <div id="population-controls-body" class="panel-body space-y-4">
+                <!-- Population specific controls here - simplified for now -->
+                <div class="space-y-3">
+                    <label class="text-xs font-medium text-gray-400 uppercase tracking-wider">Demand Layer</label>
                 <div id="population-base-toggle" class="grid grid-cols-1 gap-1 bg-surface-variant rounded-lg p-1">
                     <button data-base="population"
                         class="px-3 py-1.5 rounded-md text-xs font-medium bg-gray-600 text-white shadow-sm text-center">Population</button>
                     <button data-base="electricity"
                         class="px-3 py-1.5 rounded-md text-xs font-medium text-gray-400 hover:text-white text-center">Electricity
                         Demand</button>
+                    <button data-base="uptime"
+                        class="px-3 py-1.5 rounded-md text-xs font-medium text-gray-400 hover:text-white text-center">Grid
+                        Reliability</button>
                     <button data-base="access"
-                        class="px-3 py-1.5 rounded-md text-xs font-medium text-gray-400 hover:text-white text-center">Energy
+                        class="px-3 py-1.5 rounded-md text-xs font-medium text-gray-400 hover:text-white text-center">Electricity
                         Access</button>
                     <button data-base="plants"
                         class="px-3 py-1.5 rounded-md text-xs font-medium text-gray-400 hover:text-white text-center">Capacity
@@ -361,121 +377,163 @@
                 <p id="population-demand-description" class="hidden text-xs text-slate-400 mt-2 italic px-1">
 
                 </p>
-            </div>
-
-            <!-- Plant Status Toggle (visible when baseLayer === 'plants') -->
-            <div id="plant-status-toggle" class="hidden space-y-3">
-                <label class="text-xs font-medium text-gray-400 uppercase tracking-wider">Plant Status</label>
-                <div id="plant-status-buttons" class="grid grid-cols-2 bg-surface-variant rounded-lg p-1">
-                    <button data-status="announced"
-                        class="px-3 py-1.5 rounded-md text-xs font-medium bg-gray-600 text-white shadow-sm">Announced</button>
-                    <button data-status="existing"
-                        class="px-3 py-1.5 rounded-md text-xs font-medium text-gray-400 hover:text-white">Existing</button>
+                <div id="reliability-threshold-control" class="hidden space-y-2 pt-3 border-t border-white/10">
+                    <label class="text-xs font-medium text-gray-400 uppercase tracking-wider">Uptime Threshold</label>
+                    <div class="flex justify-between items-end">
+                        <label class="text-xs text-gray-300">People below</label>
+                        <span class="text-lg font-light text-emerald-400"><span id="reliability-threshold-val">90</span><span
+                                class="text-xs text-gray-500 ml-1">%</span></span>
+                    </div>
+                    <input type="range" id="reliability-threshold-slider" min="0" max="100" step="5" value="90"
+                        class="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-emerald-500">
+                    <div class="text-[10px] text-gray-500">Counts people in bins with uptime &lt; X% (includes no access).</div>
                 </div>
-            </div>
-
-            <!-- Fuel Type Filter (visible when baseLayer === 'plants') -->
-            <div id="plant-fuel-filter" class="hidden space-y-2">
-                <label class="text-xs font-medium text-gray-400 uppercase tracking-wider">Fuel Types</label>
-                <div class="flex flex-wrap gap-2">
-                    <button data-fuel="coal"
-                        class="px-2 py-1 rounded-md text-xs font-medium bg-slate-700 text-slate-100 hover:bg-slate-600 transition-colors">Coal</button>
-                    <button data-fuel="oil_gas"
-                        class="px-2 py-1 rounded-md text-xs font-medium bg-slate-700 text-slate-100 hover:bg-slate-600 transition-colors">Oil
-                        & Gas</button>
-                    <button data-fuel="bioenergy"
-                        class="px-2 py-1 rounded-md text-xs font-medium bg-slate-700 text-slate-100 hover:bg-slate-600 transition-colors">Bioenergy</button>
-                    <button data-fuel="nuclear"
-                        class="px-2 py-1 rounded-md text-xs font-medium bg-slate-700 text-slate-100 hover:bg-slate-600 transition-colors">Nuclear</button>
                 </div>
-            </div>
 
-            <!-- Plant Legend (visible when baseLayer === 'plants') -->
-            <div id="plant-legend" class="hidden space-y-2 pt-2 border-t border-white/10">
-                <div class="grid grid-cols-2 gap-2 text-xs text-gray-400">
-                    <div id="legend-item-coal"
-                        class="flex items-center gap-2 cursor-pointer hover:opacity-80 transition-opacity"
-                        title="Toggle Coal">
-                        <span class="w-2 h-2 rounded-full bg-orange-500"></span> Coal
-                    </div>
-                    <div id="legend-item-oil_gas"
-                        class="flex items-center gap-2 cursor-pointer hover:opacity-80 transition-opacity"
-                        title="Toggle Oil & Gas">
-                        <span class="w-2 h-2 rounded-full bg-sky-400"></span> Oil & Gas
-                    </div>
-                    <div id="legend-item-bioenergy"
-                        class="flex items-center gap-2 cursor-pointer hover:opacity-80 transition-opacity"
-                        title="Toggle Bioenergy">
-                        <span class="w-2 h-2 rounded-full bg-lime-500"></span> Bioenergy
-                    </div>
-                    <div id="legend-item-nuclear"
-                        class="flex items-center gap-2 cursor-pointer hover:opacity-80 transition-opacity"
-                        title="Toggle Nuclear">
-                        <span class="w-2 h-2 rounded-full bg-purple-500"></span> Nuclear
+                <!-- Plant Status Toggle (visible when baseLayer === 'plants') -->
+                <div id="plant-status-toggle" class="hidden space-y-3">
+                    <label class="text-xs font-medium text-gray-400 uppercase tracking-wider">Plant Status</label>
+                    <div id="plant-status-buttons" class="grid grid-cols-2 bg-surface-variant rounded-lg p-1">
+                        <button data-status="announced"
+                            class="px-3 py-1.5 rounded-md text-xs font-medium bg-gray-600 text-white shadow-sm">Announced</button>
+                        <button data-status="existing"
+                            class="px-3 py-1.5 rounded-md text-xs font-medium text-gray-400 hover:text-white">Existing</button>
                     </div>
                 </div>
+
+                <!-- Fuel Type Filter (visible when baseLayer === 'plants') -->
+                <div id="plant-fuel-filter" class="hidden space-y-2">
+                    <label class="text-xs font-medium text-gray-400 uppercase tracking-wider">Fuel Types</label>
+                    <div class="flex flex-wrap gap-2">
+                        <button data-fuel="coal"
+                            class="px-2 py-1 rounded-md text-xs font-medium bg-slate-700 text-slate-100 hover:bg-slate-600 transition-colors">Coal</button>
+                        <button data-fuel="oil_gas"
+                            class="px-2 py-1 rounded-md text-xs font-medium bg-slate-700 text-slate-100 hover:bg-slate-600 transition-colors">Oil
+                            & Gas</button>
+                        <button data-fuel="bioenergy"
+                            class="px-2 py-1 rounded-md text-xs font-medium bg-slate-700 text-slate-100 hover:bg-slate-600 transition-colors">Bioenergy</button>
+                        <button data-fuel="nuclear"
+                            class="px-2 py-1 rounded-md text-xs font-medium bg-slate-700 text-slate-100 hover:bg-slate-600 transition-colors">Nuclear</button>
+                    </div>
+                </div>
+
+                <!-- Plant Legend (visible when baseLayer === 'plants') -->
+                <div id="plant-legend" class="hidden space-y-2 pt-2 border-t border-white/10">
+                    <div class="grid grid-cols-2 gap-2 text-xs text-gray-400">
+                        <div id="legend-item-coal"
+                            class="flex items-center gap-2 cursor-pointer hover:opacity-80 transition-opacity"
+                            title="Toggle Coal">
+                            <span class="w-2 h-2 rounded-full bg-orange-500"></span> Coal
+                        </div>
+                        <div id="legend-item-oil_gas"
+                            class="flex items-center gap-2 cursor-pointer hover:opacity-80 transition-opacity"
+                            title="Toggle Oil & Gas">
+                            <span class="w-2 h-2 rounded-full bg-sky-400"></span> Oil & Gas
+                        </div>
+                        <div id="legend-item-bioenergy"
+                            class="flex items-center gap-2 cursor-pointer hover:opacity-80 transition-opacity"
+                            title="Toggle Bioenergy">
+                            <span class="w-2 h-2 rounded-full bg-lime-500"></span> Bioenergy
+                        </div>
+                        <div id="legend-item-nuclear"
+                            class="flex items-center gap-2 cursor-pointer hover:opacity-80 transition-opacity"
+                            title="Toggle Nuclear">
+                            <span class="w-2 h-2 rounded-full bg-purple-500"></span> Nuclear
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Population View Toggle (Bottom Center) -->
+    <div id="population-view-toggle"
+        class="hidden pointer-events-auto bg-surface/90 backdrop-blur-md border border-white/10 rounded-full shadow-lg p-1 flex gap-1 absolute bottom-6 left-1/2 -translate-x-1/2 z-30">
+        <div id="population-display-toggle" class="grid grid-cols-2 bg-surface-variant rounded-full p-0.5">
+            <button data-mode="map"
+                class="px-3 py-1 rounded-full text-[11px] font-medium bg-gray-600 text-white shadow-sm">Map</button>
+            <button data-mode="charts"
+                class="px-3 py-1 rounded-full text-[11px] font-medium text-gray-400 hover:text-white">Charts</button>
+        </div>
+    </div>
+
+    <!-- Population Supply Controls (Right) -->
+    <div id="population-supply-controls" class="hidden absolute top-20 right-4 z-30 w-80 flex flex-col gap-3 pointer-events-none">
+        <div id="population-supply-panel"
+            class="pointer-events-auto bg-surface/90 backdrop-blur-md border border-white/10 rounded-2xl shadow-xl p-5 max-h-[80vh] overflow-y-auto panel-collapsible ml-auto">
+            <div class="panel-header flex items-center justify-between mb-2">
+                <h2 class="panel-title text-sm font-medium text-gray-400 uppercase tracking-wider">Supply</h2>
+                <button id="population-supply-toggle"
+                    class="panel-collapse-btn text-gray-500 hover:text-white transition-colors"
+                    title="Collapse panel" aria-expanded="true">
+                    <span class="material-symbols-outlined text-[20px]">chevron_right</span>
+                </button>
             </div>
 
-            <div class="space-y-3">
-                <label class="text-xs font-medium text-gray-400 uppercase tracking-wider">Supply Layer</label>
+            <div id="population-supply-body" class="panel-body space-y-4">
+                <div class="space-y-3">
+                    <label class="text-xs font-medium text-gray-400 uppercase tracking-wider">Supply Layer</label>
                 <div id="population-overlay-mode" class="grid grid-cols-1 gap-1 bg-surface-variant rounded-lg p-1">
-                    <button data-overlay="none"
-                        class="px-3 py-1.5 rounded-md text-xs font-medium bg-gray-600 text-white shadow-sm text-center">None</button>
                     <button data-overlay="cf"
-                        class="px-3 py-1.5 rounded-md text-xs font-medium text-gray-400 hover:text-white text-center">Capacity
+                        class="px-3 py-1.5 rounded-md text-xs font-medium bg-gray-600 text-white shadow-sm text-center">Capacity
                         Factor</button>
                     <button data-overlay="lcoe"
                         class="px-3 py-1.5 rounded-md text-xs font-medium text-gray-400 hover:text-white text-center">Levelized
                         Cost of Energy</button>
+                    <button data-overlay="potential"
+                        class="px-3 py-1.5 rounded-md text-xs font-medium text-gray-400 hover:text-white text-center">Potential
+                        Map</button>
                 </div>
             </div>
 
-            <!-- CF Overlay Controls (Shown when CF overlay selected) -->
-            <div id="population-cf-controls" class="hidden space-y-4 pt-4 border-t border-white/10">
-                <h3 class="text-xs font-medium text-gray-400 uppercase tracking-wider">CF Parameters</h3>
+                <!-- CF Overlay Controls (Shown when CF overlay selected) -->
+                <div id="population-cf-controls" class="hidden space-y-4 pt-4 border-t border-white/10">
+                    <h3 class="text-xs font-medium text-gray-400 uppercase tracking-wider">CF Parameters</h3>
 
-                <!-- Solar Slider -->
-                <div class="space-y-2">
-                    <div class="flex justify-between items-end">
-                        <label class="text-xs text-gray-300">Solar Capacity<br><span
-                                class="text-[10px] text-gray-500 font-normal">MW per MW baseload</span></label>
-                        <span class="text-lg font-light text-amber-400"><span id="pop-solar-val">5</span><span
-                                class="text-xs text-gray-500 ml-1">MW_DC</span></span>
+                    <!-- Solar Slider -->
+                    <div class="space-y-2">
+                        <div class="flex justify-between items-end">
+                            <label class="text-xs text-gray-300">Solar Capacity<br><span
+                                    class="text-[10px] text-gray-500 font-normal">MW per MW baseload</span></label>
+                            <span class="text-lg font-light text-amber-400"><span id="pop-solar-val">5</span><span
+                                    class="text-xs text-gray-500 ml-1">MW_DC</span></span>
+                        </div>
+                        <input type="range" id="pop-solar-slider" min="1" max="20" step="1" value="5"
+                            class="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-amber-500">
                     </div>
-                    <input type="range" id="pop-solar-slider" min="1" max="20" step="1" value="5"
-                        class="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-amber-500">
+
+                    <!-- Battery Slider -->
+                    <div class="space-y-2">
+                        <div class="flex justify-between items-end">
+                            <label class="text-xs text-gray-300">Battery Storage<br><span
+                                    class="text-[10px] text-gray-500 font-normal">MWh per MW baseload</span></label>
+                            <span class="text-lg font-light text-cyan-400"><span id="pop-batt-val">8</span><span
+                                    class="text-xs text-gray-500 ml-1">MWh</span></span>
+                        </div>
+                        <input type="range" id="pop-batt-slider" min="0" max="36" step="2" value="8"
+                            class="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500">
+                    </div>
                 </div>
 
-                <!-- Battery Slider -->
-                <div class="space-y-2">
-                    <div class="flex justify-between items-end">
-                        <label class="text-xs text-gray-300">Battery Storage<br><span
-                                class="text-[10px] text-gray-500 font-normal">MWh per MW baseload</span></label>
-                        <span class="text-lg font-light text-cyan-400"><span id="pop-batt-val">8</span><span
-                                class="text-xs text-gray-500 ml-1">MWh</span></span>
-                    </div>
-                    <input type="range" id="pop-batt-slider" min="0" max="36" step="2" value="8"
-                        class="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500">
-                </div>
-            </div>
-
-            <!-- LCOE Overlay Controls (Shown when LCOE overlay selected) -->
-            <div id="population-lcoe-controls" class="hidden space-y-4 pt-4 border-t border-white/10">
-                <h3 class="text-xs font-medium text-gray-400 uppercase tracking-wider">LCOE Parameters</h3>
+                <!-- LCOE Overlay Controls (Shown when LCOE overlay selected) -->
+                <div id="population-lcoe-controls" class="hidden space-y-4 pt-4 border-t border-white/10">
+                    <h3 class="text-xs font-medium text-gray-400 uppercase tracking-wider">LCOE Parameters</h3>
 
                 <!-- Target CF -->
-                <div class="space-y-2">
-                    <label class="text-xs text-gray-400 uppercase">Target Capacity Factor</label>
-                    <div class="flex items-center gap-3">
-                        <input type="range" id="pop-target-cf-slider" min="50" max="100" step="1" value="90"
-                            class="flex-1 h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-emerald-500">
-                        <span class="text-sm font-mono text-emerald-400 w-12 text-right"><span
-                                id="pop-target-cf-val">90</span>%</span>
+                    <div class="space-y-2">
+                        <label class="text-xs text-gray-400 uppercase">Target Capacity Factor</label>
+                        <div class="flex items-center gap-3">
+                            <input type="range" id="pop-target-cf-slider" min="50" max="100" step="1" value="90"
+                                class="flex-1 h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-emerald-500">
+                            <span class="text-sm font-mono text-emerald-400 w-12 text-right"><span
+                                    id="pop-target-cf-val">90</span>%</span>
+                        </div>
                     </div>
-                </div>
 
                 <!-- All LCOE Params -->
-                <div class="grid grid-cols-2 gap-2">
+                    <div class="grid grid-cols-2 gap-2">
                     <label class="space-y-1 col-span-2">
                         <div class="flex items-center justify-between">
                             <span class="text-[10px] text-gray-500 uppercase">Capex Source</span>
@@ -540,19 +598,36 @@
                             input.</div>
                     </label>
                 </div>
-            </div>
+                </div>
 
-            <div class="space-y-3">
-                <label class="text-xs font-medium text-gray-400 uppercase tracking-wider">View</label>
-                <div id="population-display-toggle" class="grid grid-cols-2 bg-surface-variant rounded-lg p-1">
-                    <button data-mode="map"
-                        class="px-3 py-1.5 rounded-md text-xs font-medium bg-gray-600 text-white shadow-sm">Map</button>
-                    <button data-mode="charts"
-                        class="px-3 py-1.5 rounded-md text-xs font-medium text-gray-400 hover:text-white">Charts</button>
+                <!-- Potential Overlay Controls (Shown when Potential overlay selected) -->
+                <div id="population-potential-controls" class="hidden space-y-4 pt-4 border-t border-white/10">
+                    <h3 class="text-xs font-medium text-gray-400 uppercase tracking-wider">Potential Parameters</h3>
+                    <div class="space-y-2">
+                        <label class="text-xs font-medium text-gray-400 uppercase tracking-wider">Siting Constraints</label>
+                        <div id="supply-potential-level-toggle" class="grid grid-cols-2 bg-surface-variant rounded-lg p-1">
+                            <button data-level="level1"
+                                class="px-3 py-1.5 rounded-md text-xs font-medium bg-gray-600 text-white shadow-sm">Technical</button>
+                            <button data-level="level2"
+                                class="px-3 py-1.5 rounded-md text-xs font-medium text-gray-400 hover:text-white">Policy</button>
+                        </div>
+                        <div class="text-[10px] text-gray-500 leading-snug">
+                            Technical excludes rugged terrain, urban/industrial areas, forests, and very remote zones. Policy adds regulatory limits.
+                        </div>
+                    </div>
+                    <div class="space-y-2">
+                        <label class="text-xs font-medium text-gray-400 uppercase tracking-wider">Display</label>
+                        <div id="supply-potential-display-toggle" class="grid grid-cols-2 bg-surface-variant rounded-lg p-1">
+                            <button data-display="total"
+                                class="px-3 py-1.5 rounded-md text-xs font-medium text-gray-400 hover:text-white">Total (TWh/yr)</button>
+                            <button data-display="multiple"
+                                class="px-3 py-1.5 rounded-md text-xs font-medium bg-gray-600 text-white shadow-sm">× Demand</button>
+                        </div>
+                        <div class="text-[10px] text-gray-500">Assumes 30 MW/km² capacity density.</div>
+                    </div>
                 </div>
             </div>
         </div>
-
     </div>
 
     <!-- LCOE Cost Decline Timeline (Top Right) -->
@@ -576,7 +651,7 @@
     </div>
 
     <!-- Right Bottom Legends (Floating) -->
-    <div class="absolute bottom-8 right-4 z-20 flex flex-col items-end gap-3 pointer-events-none">
+    <div id="legend-stack" class="absolute bottom-8 right-4 z-20 flex flex-col items-end gap-3 pointer-events-none">
 
         <!-- Capacity Legend -->
         <div id="legend-capacity"
@@ -683,8 +758,8 @@
         <div id="legend-access"
             class="hidden pointer-events-auto bg-surface/90 backdrop-blur-md border border-white/10 rounded-xl shadow-xl p-4 w-64">
             <div class="flex justify-between items-center mb-2">
-                <div class="text-xs font-medium text-gray-400 uppercase tracking-wider">Energy Access</div>
-                <div class="flex bg-slate-800 rounded p-0.5 border border-slate-700">
+                <div id="legend-access-title" class="text-xs font-medium text-gray-400 uppercase tracking-wider">Grid Reliability</div>
+                <div id="legend-access-toggle" class="flex bg-slate-800 rounded p-0.5 border border-slate-700">
                     <button id="btn-access-rel"
                         class="px-2 py-0.5 text-[10px] rounded bg-slate-600 text-white shadow-sm transition-all">Reliability</button>
                     <button id="btn-access-none"
@@ -693,18 +768,63 @@
                 </div>
             </div>
             <div id="legend-access-bar" class="w-full h-2 rounded-full mb-2"
-                style="background: linear-gradient(to right, #ef4444, #eab308, #22c55e);"></div>
+                style="background: linear-gradient(to right, #ef4444, #6b7280);"></div>
             <div class="flex justify-between text-[10px] font-mono text-gray-500 mb-2">
-                <span>0%</span>
-                <span>50%</span>
-                <span>100%</span>
+                <span id="legend-access-min">0%</span>
+                <span id="legend-access-mid"></span>
+                <span id="legend-access-max">100%</span>
             </div>
             <div class="flex items-center gap-2 pt-2 border-t border-white/10">
                 <span class="w-3 h-3 rounded-sm bg-slate-700 border border-slate-600"></span>
-                <span class="text-[10px] text-gray-400">No Data (HREA not covered)</span>
+                <span id="legend-access-note" class="text-[10px] text-gray-400">No Data (HREA not covered)</span>
             </div>
         </div>
 
+    </div>
+
+    <!-- Supply Legends (Population Split Map) -->
+    <div id="legend-supply-stack"
+        class="hidden absolute bottom-8 right-4 z-20 flex flex-col items-end gap-3 pointer-events-none">
+        <!-- Supply Capacity Legend -->
+        <div id="legend-supply-capacity"
+            class="hidden pointer-events-auto bg-surface/90 backdrop-blur-md border border-white/10 rounded-xl shadow-xl p-4 w-64">
+            <div class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">Capacity Factor</div>
+            <div class="w-full h-2 rounded-full mb-2 legend-gradient"></div>
+            <div class="flex justify-between text-[10px] font-mono text-gray-500">
+                <span>5%</span>
+                <span>40%</span>
+                <span>70%</span>
+                <span>100%</span>
+            </div>
+        </div>
+
+        <!-- Supply LCOE Legend -->
+        <div id="legend-supply-lcoe"
+            class="hidden pointer-events-auto bg-surface/90 backdrop-blur-md border border-white/10 rounded-xl shadow-xl p-4 w-64">
+            <div id="legend-supply-lcoe-title" class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">
+                LCOE ($/MWh)</div>
+            <div class="w-full h-2 rounded-full mb-2 legend-gradient-cost" id="legend-supply-lcoe-bar"></div>
+            <div class="flex justify-between text-[10px] font-mono text-gray-500 mb-2">
+                <span id="legend-supply-lcoe-min">--</span>
+                <span id="legend-supply-lcoe-mid">--</span>
+                <span id="legend-supply-lcoe-max">--</span>
+            </div>
+            <div class="text-[10px] text-gray-400" id="legend-supply-lcoe-ref">Reference: --</div>
+            <div id="legend-supply-lcoe-notes" class="hidden text-[10px] text-gray-400 mt-2 space-y-1"></div>
+        </div>
+
+        <!-- Supply Potential Legend -->
+        <div id="legend-supply-potential"
+            class="hidden pointer-events-auto bg-surface/90 backdrop-blur-md border border-white/10 rounded-xl shadow-xl p-4 w-64">
+            <div id="legend-supply-potential-title"
+                class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">Solar Generation Potential (TWh/yr)</div>
+            <div id="legend-supply-potential-bar" class="w-full h-2 rounded-full mb-2 legend-gradient-potential"></div>
+            <div id="legend-supply-potential-buckets" class="hidden space-y-1 text-[10px] text-gray-500"></div>
+            <div class="flex justify-between text-[10px] font-mono text-gray-500">
+                <span id="legend-supply-potential-min">--</span>
+                <span id="legend-supply-potential-max">--</span>
+            </div>
+        </div>
     </div>
 
 
@@ -799,18 +919,29 @@
 
     <!-- Population Charts Overlay (Full Screen-ish) -->
     <div id="population-charts"
-        class="hidden absolute inset-0 z-10 bg-black/95 overflow-y-auto pt-24 pb-10 pr-4 sm:pr-10 pl-96">
-        <div class="max-w-6xl mx-auto space-y-6">
+        class="hidden absolute inset-0 z-10 bg-black/95 overflow-y-auto pt-24 pb-10 population-charts-shell">
+        <div class="max-w-6xl mx-auto space-y-6 population-charts-inner">
             <div class="flex justify-between items-center">
                 <h2 id="charts-main-heading" class="text-xl font-semibold text-white">Population Analysis</h2>
                 <button id="close-charts" class="text-primary hover:text-white text-sm font-medium">Back to Map</button>
             </div>
 
-            <!-- Percentile Chart - Full Width -->
+            <!-- Latitude Charts - Side by Side (Demand / Supply) -->
+            <div id="standard-charts-container" class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div class="bg-surface border border-white/10 rounded-xl p-6">
+                    <h3 id="chart-title-demand-latitude" class="text-sm font-medium text-gray-400 mb-4">Demand by Latitude</h3>
+                    <div class="h-64"><canvas id="population-chart-lat-pop"></canvas></div>
+                </div>
+                <div class="bg-surface border border-white/10 rounded-xl p-6">
+                    <h3 id="chart-title-supply-latitude" class="text-sm font-medium text-gray-400 mb-4">Supply by Latitude</h3>
+                    <div class="h-64"><canvas id="population-chart-lat-metric"></canvas></div>
+                </div>
+            </div>
+
+            <!-- Histogram (Supply vs Demand) -->
             <div class="bg-surface border border-white/10 rounded-xl p-6">
                 <div class="flex justify-between items-center mb-4">
-                    <h3 id="chart-title-percentile" class="text-sm font-medium text-gray-400">Metric by Population
-                        Percentile</h3>
+                    <h3 id="chart-title-percentile" class="text-sm font-medium text-gray-400">Demand vs Supply Distribution</h3>
                     <button id="chart-cumulative-toggle"
                         class="px-3 py-1 rounded-md text-xs font-medium bg-surface-variant text-gray-400 hover:text-white hover:bg-gray-600 transition-colors border border-white/5">
                         Cumulative: OFF
@@ -819,24 +950,11 @@
                 <div class="h-64"><canvas id="population-chart-histogram"></canvas></div>
             </div>
 
-            <!-- Latitude Charts - Side by Side -->
-            <div id="standard-charts-container" class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                <div class="bg-surface border border-white/10 rounded-xl p-6">
-                    <h3 id="chart-title-latitude" class="text-sm font-medium text-gray-400 mb-4">Metric by Latitude</h3>
-                    <div class="h-64"><canvas id="population-chart-lat-metric"></canvas></div>
-                </div>
-                <div class="bg-surface border border-white/10 rounded-xl p-6">
-                    <h3 id="chart-title-distribution" class="text-sm font-medium text-gray-400 mb-4">Population
-                        Distribution</h3>
-                    <div class="h-64"><canvas id="population-chart-lat-pop"></canvas></div>
-                </div>
-            </div>
-
             <!-- Access-Specific Charts (Hidden by default, shown for Energy Access layer) -->
             <div id="access-charts-container" class="hidden space-y-6">
                 <!-- Chart 1: Grid Uptime Distribution -->
                 <div class="bg-surface border border-white/10 rounded-xl p-6">
-                    <h3 class="text-sm font-medium text-gray-400 mb-4">Grid Uptime by Population Share</h3>
+                    <h3 class="text-sm font-medium text-gray-400 mb-4">Grid Uptime by Population</h3>
                     <p class="text-xs text-gray-500 mb-4">Distribution of grid reliability weighted by population</p>
                     <div class="h-64"><canvas id="access-chart-uptime"></canvas></div>
                 </div>

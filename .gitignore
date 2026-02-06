@@ -3,6 +3,7 @@
 
 # Local workspaces and archives (not for GitHub)
 workspace/
+output/
 deployment/OLD/
 
 # Node tooling
