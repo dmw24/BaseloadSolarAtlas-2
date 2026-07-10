@@ -241,7 +241,7 @@ The browser performs only these operations:
 ## File Structure
 
 ```
-BaseloadSolarAtlas/
+SolarBatteryAtlas/
 ├── index.html                          # Main application interface
 ├── css/
 │   └── style.css                       # Styling
