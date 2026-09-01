@@ -15,6 +15,10 @@
     --ember-hover: #fbbf24;
     --solar: #f59e0b;
     --battery: #a855f7;
+    /* Land fill for the local basemap (js/basemap.js), sampled from the CARTO
+       dark_nolabels tiles it replaced so the map looks unchanged. The ocean is
+       just the map container's own background, already set per app. */
+    --map-land: #262626;
     /* SF Pro (Apple system font, à la Substack). Falls back gracefully on
        non-Apple platforms. Single source of truth — Tailwind's font-sans is
        set to the same stack in tailwind.config.js. */

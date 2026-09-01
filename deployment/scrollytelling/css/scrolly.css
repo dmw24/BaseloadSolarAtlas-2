@@ -13,6 +13,10 @@
     --ember-hover: #fbbf24;
     --solar: #f59e0b;
     --battery: #a855f7;
+    /* Land fill for the local basemap (js/basemap.js), sampled from the CARTO
+       dark_nolabels tiles it replaced so the map looks unchanged. The ocean is
+       just the map container's own background, already set per app. */
+    --map-land: #262626;
     /* SF Pro (Apple system font, à la Substack). Kept in sync with
        ../css/style.css and Tailwind's font-sans. */
     --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'SF Pro', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
@@ -995,4 +999,11 @@ html {
     .chart-wrapper {
         padding: 0.75rem 1rem;
     }
+}
+
+/* Ocean. The main map sets its own bg-[#0a0a0a] inline, but maps created
+   lazily (the subset/comparison map) have no background class — without this
+   they'd fall back to Leaflet's default #ddd now the tiles are gone. */
+.leaflet-container {
+    background: #0a0a0a;
 }

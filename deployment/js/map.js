@@ -15,6 +15,7 @@ import {
 import { createSharedPopup, buildTooltipHtml, buildCfTooltip, buildLcoeTooltip, buildPlantTooltip, formatFirmCfText, buildDieselBackupLines, buildCountryLine } from './tooltip.js';
 import { initDayNight, updateDayNight, hideDayNight } from './daynight.js';
 import { createVoronoiCanvasLayer } from './voronoi-canvas.js';
+import { addLandBasemap } from './basemap.js';
 
 // Map a value to a bucket color (shared by the "× Demand" and "per capita"
 // potential display modes, which both use discrete colour buckets).
@@ -656,12 +657,8 @@ export async function initMap(onLocationSelect) {
 
     markerRenderer = L.canvas({ padding: 0.5 });
 
-    // Dark Matter basemap
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', {
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
-        subdomains: 'abcd',
-        maxZoom: 19
-    }).addTo(map);
+    // Land basemap, drawn locally from Natural Earth (see basemap.js).
+    ensureWorldGeoJsonLoaded().then(geo => addLandBasemap(map, geo));
 
     // Zoom disabled
 
@@ -735,11 +732,7 @@ function initSupplyMap() {
 
     supplyMarkerRenderer = L.canvas({ padding: 0.5 });
 
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', {
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
-        subdomains: 'abcd',
-        maxZoom: 19
-    }).addTo(supplyMap);
+    ensureWorldGeoJsonLoaded().then(geo => addLandBasemap(supplyMap, geo));
 
     supplyMarkersLayer = L.layerGroup().addTo(supplyMap);
     supplyOverlayLayer = L.layerGroup().addTo(supplyMap);
@@ -2993,10 +2986,7 @@ export async function initSubsetMap() {
         keyboard: false
     }).setView([20, 0], 2);
 
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', {
-        subdomains: 'abcd',
-        maxZoom: 19
-    }).addTo(subsetMap);
+    ensureWorldGeoJsonLoaded().then(geo => addLandBasemap(subsetMap, geo));
 
     subsetMap.createPane('voronoi');
     subsetMap.getPane('voronoi').style.zIndex = 400;

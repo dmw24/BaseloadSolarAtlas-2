@@ -16,6 +16,7 @@ import {
 import { createSharedPopup, buildTooltipHtml, buildCfTooltip, buildPlantTooltip, formatFirmCfText, buildDieselBackupLines, buildCountryLine } from './tooltip.js';
 import { initDayNight, updateDayNight, hideDayNight } from './daynight.js';
 import { createVoronoiCanvasLayer } from './voronoi-canvas.js';
+import { addLandBasemap } from './basemap.js';
 
 // Per-cell country overlap list (location_id -> ordered string[]), populated from
 // scrolly.js once the overlapping-countries CSV loads. Lets every map tooltip show
@@ -189,6 +190,33 @@ function getLcoeColor(row, colorInfo, colorScale) {
 }
 
 let worldGeoJSON = null;
+let worldGeoJsonPromise = null;
+
+function ensureWorldGeoJsonLoaded() {
+    if (worldGeoJSON) return Promise.resolve(worldGeoJSON);
+    if (worldGeoJsonPromise) return worldGeoJsonPromise;
+    const sources = [
+        '../data/world.geojson',
+        'https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_50m_land.geojson'
+    ];
+    worldGeoJsonPromise = (async () => {
+        for (const source of sources) {
+            try {
+                const response = await fetch(source);
+                if (!response.ok) continue;
+                worldGeoJSON = await response.json();
+                break;
+            } catch (_) {
+                // Try next source.
+            }
+        }
+        if (!worldGeoJSON) {
+            console.error('Could not load world GeoJSON data from local or remote sources.');
+        }
+        return worldGeoJSON;
+    })();
+    return worldGeoJsonPromise;
+}
 let voronoiClipVersion = null;
 // Geometry cache for renderVoronoi: with viewport (zoom|pixelOrigin|size) and
 // the ordered point set unchanged, a Delaunay/renderCell rebuild reproduces
@@ -273,12 +301,8 @@ export async function initMap(onLocationSelect) {
         keyboard: false
     }).setView([20, 0], 2); // World view
 
-    // Dark Matter basemap (no labels)
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', {
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
-        subdomains: 'abcd',
-        maxZoom: 19
-    }).addTo(map);
+    // Land basemap, drawn locally from Natural Earth (see basemap.js).
+    ensureWorldGeoJsonLoaded().then(geo => addLandBasemap(map, geo));
 
     // L.control.zoom({ position: 'topright' }).addTo(map);
 
@@ -309,23 +333,7 @@ export async function initMap(onLocationSelect) {
     // Store callback
     map.onLocationSelect = onLocationSelect;
 
-    const worldGeoJsonSources = [
-        '../data/world.geojson',
-        'https://raw.githubusercontent.com/holtzy/D3-graph-gallery/master/DATA/world.geojson'
-    ];
-    for (const source of worldGeoJsonSources) {
-        try {
-            const response = await fetch(source);
-            if (!response.ok) continue;
-            worldGeoJSON = await response.json();
-            break;
-        } catch (_) {
-            // Try next source.
-        }
-    }
-    if (!worldGeoJSON) {
-        console.error('Could not load world GeoJSON data from local or remote sources.');
-    }
+    await ensureWorldGeoJsonLoaded();
 }
 
 let lastData = null;
@@ -2594,10 +2602,7 @@ export async function initSubsetMap() {
         fadeAnimation: false
     }).setView([20, 0], 2);
 
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-        subdomains: 'abcd',
-        maxZoom: 19
-    }).addTo(subsetMap);
+    ensureWorldGeoJsonLoaded().then(geo => addLandBasemap(subsetMap, geo));
 
     subsetMap.createPane('voronoi');
     subsetMap.getPane('voronoi').style.zIndex = 400;
